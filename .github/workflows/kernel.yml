@@ -1,4 +1,4 @@
-name: Android14 Kernel 6.1.57 Build
+name: Android14 GKI Kernel 6.1.57
 
 on:
   workflow_dispatch:
@@ -14,38 +14,87 @@ jobs:
     env:
       ARCH: arm64
       SUBARCH: arm64
-      CLANG_VERSION: r487747
       KERNEL_DIR: kernel
       OUT_DIR: out
-      DEFCONFIG: vendor/peridot_defconfig
+      DEFCONFIG: gki_defconfig
+      CLANG_VERSION: r487747
 
     steps:
-      - name: Checkout source
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          submodules: recursive
+          submodules: false
 
-      - name: Install dependencies
+      # ====== SPACE CHECK & CLEANUP ======
+      - name: Check space before cleanup
+        run: |
+          echo "Free space before cleanup:"
+          df -h
+          sudo chown runner /mnt
+
+      - name: Cleanup
+        run: |
+          docker images
+          sudo rm -rf "/home/work/*" || true
+          sudo rm -rf "/opt/*" || true
+          sudo rm -rf "/usr/share/dotnet" || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf "/usr/local/lib/android" || true
+          sudo rm -rf "/usr/local/share/boost" || true
+          sudo rm -rf "/usr/lib/jvm" || true
+          sudo rm -rf "/usr/share/swift" || true
+          sudo rm -rf "/usr/local/julia*" || true
+          sudo rm -rf "/usr/share/kotlinc" || true
+          sudo rm -rf "/usr/local/share/edge_driver" || true
+          sudo rm -rf "/usr/local/share/chromedriver-linux64" || true
+          sudo rm -rf "/usr/local/share/gecko_driver" || true
+          sudo rm -rf "/usr/share/miniconda" || true
+          sudo rm -rf "/usr/local/share/phantomjs*" || true
+          sudo rm -rf "/usr/share/sbt" || true
+          sudo rm -rf "/usr/local/sqlpackage" || true
+          sudo rm -rf "/usr/bin/yq" || true
+          sudo rm -rf "/usr/local/share/vcpkg" || true
+          sudo rm -rf "/usr/local/bin/"{terraform,stack,aliyun,pulumi,azcopy,bicep,rebar3,packer,docker-compose,minikube,kustomize,kubectl,kind,helm} || true
+          sudo rm -rf "/home/.dotnet" "/etc/skel/.dotnet" "/home/linuxbrew" "/home/.nvm" || true
+          sudo docker image prune -a -f || true
+          rustup self uninstall -y || true
+
+          sudo apt purge -y \
+            clang* llvm* node* npm* ruby* php* dotnet-sdk* \
+            google-chrome-stable firefox powershell mono-complete \
+            docker-* podman buildah skopeo kubectl \
+            mysql* postgresql* mongodb* nginx apache2 \
+            openjdk-* temurin-* \
+            gcc-* g++-* \
+            linux-headers-* \
+            python3-* \
+            man-db manpages \
+            '*-dev' || true
+
+          sudo apt-get autoremove -y || true
+          sudo apt-get autoclean -y || true
+          df -h
+
+      # ====== DEPENDENCIES ======
+      - name: Install minimal build dependencies
         run: |
           sudo apt update
           sudo apt install -y \
             bc \
             bison \
             build-essential \
-            ccache \
             curl \
             flex \
             git \
             libelf-dev \
             libssl-dev \
             lld \
-            llvm \
             python3 \
-            python3-pip \
             unzip \
             zip
 
+      # ====== TOOLCHAIN ======
       - name: Download AOSP Clang
         run: |
           mkdir -p toolchains
@@ -54,7 +103,7 @@ jobs:
           tar -xf clang-${CLANG_VERSION}.tar.gz
           echo "CLANG_PATH=$PWD/clang-${CLANG_VERSION}/bin" >> $GITHUB_ENV
 
-      - name: Setup environment
+      - name: Setup LLVM environment
         run: |
           echo "PATH=${CLANG_PATH}:$PATH" >> $GITHUB_ENV
           echo "CC=clang" >> $GITHUB_ENV
@@ -67,7 +116,8 @@ jobs:
           echo "LLVM=1" >> $GITHUB_ENV
           echo "LLVM_IAS=1" >> $GITHUB_ENV
 
-      - name: Kernel defconfig
+      # ====== BUILD ======
+      - name: Kernel defconfig (GKI)
         run: |
           mkdir -p ${OUT_DIR}
           make -C ${KERNEL_DIR} \
@@ -75,22 +125,22 @@ jobs:
             ARCH=arm64 \
             ${DEFCONFIG}
 
-      - name: Build kernel
+      - name: Build GKI kernel
         run: |
           make -C ${KERNEL_DIR} \
             O=${OUT_DIR} \
             ARCH=arm64 \
             -j$(nproc)
 
+      # ====== ARTIFACT ======
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
           cp ${OUT_DIR}/arch/arm64/boot/Image artifacts/ || true
-          cp ${OUT_DIR}/arch/arm64/boot/Image.gz artifacts/ || true
-          cp ${OUT_DIR}/arch/arm64/boot/dtb* artifacts/ || true
+          cp ${OUT_DIR}/arch/arm64/boot/Image.lz4 artifacts/ || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: android14-kernel-6.1.57
+          name: android14-gki-6.1.57
           path: artifacts
