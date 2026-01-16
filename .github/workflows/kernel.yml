@@ -1,0 +1,96 @@
+name: Android14 Kernel 6.1.57 Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - android14-6.1
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      CLANG_VERSION: r487747
+      KERNEL_DIR: kernel
+      OUT_DIR: out
+      DEFCONFIG: vendor/peridot_defconfig
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            python3 \
+            python3-pip \
+            unzip \
+            zip
+
+      - name: Download AOSP Clang
+        run: |
+          mkdir -p toolchains
+          cd toolchains
+          curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VERSION}.tar.gz
+          tar -xf clang-${CLANG_VERSION}.tar.gz
+          echo "CLANG_PATH=$PWD/clang-${CLANG_VERSION}/bin" >> $GITHUB_ENV
+
+      - name: Setup environment
+        run: |
+          echo "PATH=${CLANG_PATH}:$PATH" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "LLVM=1" >> $GITHUB_ENV
+          echo "LLVM_IAS=1" >> $GITHUB_ENV
+
+      - name: Kernel defconfig
+        run: |
+          mkdir -p ${OUT_DIR}
+          make -C ${KERNEL_DIR} \
+            O=${OUT_DIR} \
+            ARCH=arm64 \
+            ${DEFCONFIG}
+
+      - name: Build kernel
+        run: |
+          make -C ${KERNEL_DIR} \
+            O=${OUT_DIR} \
+            ARCH=arm64 \
+            -j$(nproc)
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp ${OUT_DIR}/arch/arm64/boot/Image artifacts/ || true
+          cp ${OUT_DIR}/arch/arm64/boot/Image.gz artifacts/ || true
+          cp ${OUT_DIR}/arch/arm64/boot/dtb* artifacts/ || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android14-kernel-6.1.57
+          path: artifacts
