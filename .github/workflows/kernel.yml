@@ -95,16 +95,13 @@ jobs:
             zip
 
       # ====== TOOLCHAIN ======
-      - name: Download AOSP Clang
+      - name: Install LLVM/Clang
         run: |
-           mkdir -p toolchains
-           cd toolchains
-
-           curl -L -o clang.tar.gz \
-           https://github.com/LineageOS/android_prebuilts_clang_host_linux-x86/releases/download/clang-r487747/clang-r487747.tar.gz
-
-           tar -xf clang.tar.gz
-           echo "CLANG_PATH=$PWD/clang-r487747/bin" >> $GITHUB_ENV
+          sudo apt update
+          sudo apt install -y \
+          clang \
+          llvm \
+          lld
 
 
       - name: Setup LLVM environment
