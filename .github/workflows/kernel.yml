@@ -97,13 +97,14 @@ jobs:
       # ====== TOOLCHAIN ======
       - name: Download AOSP Clang
         run: |
-            mkdir -p toolchains
-            cd toolchains
-            curl -L -o clang.tar.gz \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-14.0.0_r0.108/clang-r487747.tar.gz
-            mkdir clang
-            tar -xf clang.tar.gz -C clang
-            echo "CLANG_PATH=$PWD/clang/bin" >> $GITHUB_ENV
+           mkdir -p toolchains
+           cd toolchains
+
+           curl -L -o clang.tar.gz \
+           https://github.com/LineageOS/android_prebuilts_clang_host_linux-x86/releases/download/clang-r487747/clang-r487747.tar.gz
+
+           tar -xf clang.tar.gz
+           echo "CLANG_PATH=$PWD/clang-r487747/bin" >> $GITHUB_ENV
 
 
       - name: Setup LLVM environment
