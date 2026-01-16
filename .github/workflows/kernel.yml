@@ -14,7 +14,6 @@ jobs:
     env:
       ARCH: arm64
       SUBARCH: arm64
-      KERNEL_DIR: kernel
       OUT_DIR: out
       DEFCONFIG: peridot_defconfig
       CLANG_VERSION: r487747
@@ -128,16 +127,13 @@ jobs:
       # ====== BUILD ======
       - name: Kernel defconfig (GKI)
         run: |
+          make clean && make mrproper
           mkdir -p ${OUT_DIR}
-          make -C ${KERNEL_DIR} \
-            O=${OUT_DIR} \
-            ARCH=arm64 \
-            ${DEFCONFIG}
+          make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
 
       - name: Build GKI kernel
         run: |
-          make -C ${KERNEL_DIR} \
-            O=${OUT_DIR} \
+          make O=${OUT_DIR} \
             ARCH=arm64 \
             -j$(nproc)
 
