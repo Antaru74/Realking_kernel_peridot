@@ -26,6 +26,35 @@ jobs:
           submodules: false
 
       # ====== SPACE CHECK & CLEANUP ======
+      - name: Force uninstall KernelSU (safe)
+        run: |
+          set +e
+          echo "== KernelSU auto-uninstall =="
+
+          # Remove KernelSU source dir if exists
+          rm -rf drivers/kernelsu
+
+          # Clean drivers/Kconfig
+          if [ -f drivers/Kconfig ]; then
+            sed -i '/kernelsu/d' drivers/Kconfig
+          fi
+
+          # Clean drivers/Makefile
+          if [ -f drivers/Makefile ]; then
+            sed -i '/kernelsu/d' drivers/Makefile
+          fi
+
+          # Clean top-level Makefile
+          if [ -f Makefile ]; then
+            sed -i '/kernelsu/d' Makefile
+          fi
+
+          # Clean any leftover configs
+          find . -type f \( -name "Kconfig" -o -name "Makefile" \) \
+            -exec sed -i '/kernelsu/d' {} +
+
+          echo "KernelSU uninstall step finished"
+
       - name: Check space before cleanup
         run: |
           echo "Free space before cleanup:"
@@ -127,7 +156,6 @@ jobs:
       # ====== BUILD ======
       - name: Kernel defconfig (GKI)
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           make clean && make mrproper
           mkdir -p ${OUT_DIR}
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
