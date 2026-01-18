@@ -1,93 +1,129 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * RPMh regulator driver with uv_override support
+ * RPMh regulator driver
+ *
+ * Copyright (c) 2018-2024, Qualcomm Innovation Center, Inc.
  */
 
+#include <linux/bitops.h>
+#include <linux/device.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/of_regulator.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/platform_device.h>
+#include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
-#include <linux/sysfs.h>
-#include <linux/device.h>
+#include <linux/string.h>
 
+#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/rpmh.h>
 
+#define RPMH_ARC_MAX_LEN		16
+#define RPMH_VREG_TYPE_MAX_LEN		16
+
 struct rpmh_vreg {
-	struct regulator_desc desc;
-	struct regulator_dev *rdev;
-	struct rpmh_client *client;
-
-	int voltage_uv;
-	int uv_override;
-	bool use_uv_override;
-
-	u32 addr;
-	u32 resource_id;
-	struct mutex lock;
+	struct device			*dev;
+	struct regulator_dev		*rdev;
+	struct rpmh_resource		*res;
+	const char			*name;
+	u32				addr;
+	u32				current_uV;
+	u32				enabled;
+	int				uv_override; /* -1 = disabled */
 };
 
-/* ========================================================= */
-/* Voltage handling                                           */
-/* ========================================================= */
+struct rpmh_regulator_data {
+	const char			*name;
+	const char			*type;
+};
 
-static int rpmh_vreg_send_voltage(struct rpmh_vreg *vreg, int uv)
+static const struct rpmh_regulator_data rpmh_regulators[] = {
+	{ .name = "ldo", .type = "ldo" },
+	{ .name = "smps", .type = "smps" },
+	{ .name = "bob", .type = "bob" },
+};
+
+static int rpmh_regulator_enable(struct regulator_dev *rdev)
 {
-	u32 val;
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
-	/* uV → RPMh encoding（既存処理） */
-	val = DIV_ROUND_UP(uv, 1000);
+	if (vreg->enabled)
+		return 0;
 
-	return rpmh_write_async(vreg->client, RPMH_ACTIVE_ONLY,
-				vreg->addr, val);
+	rpmh_write_async(vreg->res, RPMH_ACTIVE_ONLY_STATE,
+			 vreg->addr, 1);
+	vreg->enabled = 1;
+
+	return 0;
+}
+
+static int rpmh_regulator_disable(struct regulator_dev *rdev)
+{
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+
+	if (!vreg->enabled)
+		return 0;
+
+	rpmh_write_async(vreg->res, RPMH_ACTIVE_ONLY_STATE,
+			 vreg->addr, 0);
+	vreg->enabled = 0;
+
+	return 0;
+}
+
+static int rpmh_regulator_is_enabled(struct regulator_dev *rdev)
+{
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+
+	return vreg->enabled;
 }
 
 static int rpmh_regulator_set_voltage(struct regulator_dev *rdev,
-				      int min_uv, int max_uv,
+				      int min_uV, int max_uV,
 				      unsigned int *selector)
 {
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	int uv;
-	int ret;
+	int uV;
 
-	mutex_lock(&vreg->lock);
+	/* uv_override handling */
+	if (vreg->uv_override >= 0) {
+		min_uV = vreg->uv_override;
+		max_uV = vreg->uv_override;
+	}
 
-	if (vreg->use_uv_override)
-		uv = vreg->uv_override;
-	else
-		uv = min_uv;
+	uV = min_uV;
 
-	ret = rpmh_vreg_send_voltage(vreg, uv);
-	if (!ret)
-		vreg->voltage_uv = uv;
+	rpmh_write_async(vreg->res, RPMH_ACTIVE_ONLY_STATE,
+			 vreg->addr, uV);
+	vreg->current_uV = uV;
 
-	mutex_unlock(&vreg->lock);
-	return ret;
+	return 0;
 }
 
 static int rpmh_regulator_get_voltage(struct regulator_dev *rdev)
 {
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
-	return vreg->voltage_uv;
+	if (vreg->uv_override >= 0)
+		return vreg->uv_override;
+
+	return vreg->current_uV;
 }
 
-/* ========================================================= */
-/* sysfs: uv_override                                         */
-/* ========================================================= */
+/* ================= uv_override sysfs ================= */
 
 static ssize_t uv_override_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
+				struct device_attribute *attr,
+				char *buf)
 {
 	struct regulator_dev *rdev = dev_get_drvdata(dev);
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n",
-			 vreg->use_uv_override ? vreg->uv_override : 0);
+			 vreg->uv_override);
 }
 
 static ssize_t uv_override_store(struct device *dev,
@@ -96,94 +132,79 @@ static ssize_t uv_override_store(struct device *dev,
 {
 	struct regulator_dev *rdev = dev_get_drvdata(dev);
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	int uv;
-	int ret;
+	int val;
 
-	if (kstrtoint(buf, 10, &uv))
+	if (kstrtoint(buf, 0, &val))
 		return -EINVAL;
 
-	mutex_lock(&vreg->lock);
+	if (val < 0)
+		vreg->uv_override = -1;
+	else
+		vreg->uv_override = val;
 
-	if (uv <= 0) {
-		vreg->use_uv_override = false;
-	} else {
-		vreg->uv_override = uv;
-		vreg->use_uv_override = true;
-		ret = rpmh_vreg_send_voltage(vreg, uv);
-		if (ret) {
-			mutex_unlock(&vreg->lock);
-			return ret;
-		}
-		vreg->voltage_uv = uv;
-	}
-
-	mutex_unlock(&vreg->lock);
 	return count;
 }
 
 static DEVICE_ATTR_RW(uv_override);
 
-/* ========================================================= */
-/* regulator ops                                              */
-/* ========================================================= */
+/* ==================================================== */
 
 static const struct regulator_ops rpmh_regulator_ops = {
-	.set_voltage = rpmh_regulator_set_voltage,
-	.get_voltage = rpmh_regulator_get_voltage,
+	.enable		= rpmh_regulator_enable,
+	.disable	= rpmh_regulator_disable,
+	.is_enabled	= rpmh_regulator_is_enabled,
+	.set_voltage	= rpmh_regulator_set_voltage,
+	.get_voltage	= rpmh_regulator_get_voltage,
 };
-
-/* ========================================================= */
-/* probe                                                      */
-/* ========================================================= */
 
 static int rpmh_regulator_probe(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct rpmh_vreg *vreg;
 	struct regulator_config config = {};
+	struct regulator_desc *rdesc;
+	const char *name;
 	int ret;
 
-	vreg = devm_kzalloc(&pdev->dev, sizeof(*vreg), GFP_KERNEL);
-	if (!vreg)
-		return -ENOMEM;
-
-	mutex_init(&vreg->lock);
-
-	vreg->client = rpmh_get_byname(pdev->dev.of_node, "regulator");
-	if (IS_ERR(vreg->client))
-		return PTR_ERR(vreg->client);
-
-	/* 既存 DT パース処理（省略せず実機に合わせて） */
-	of_property_read_u32(pdev->dev.of_node, "qcom,resource-id",
-			     &vreg->resource_id);
-	of_property_read_u32(pdev->dev.of_node, "qcom,addr",
-			     &vreg->addr);
-
-	vreg->desc.name = dev_name(&pdev->dev);
-	vreg->desc.type = REGULATOR_VOLTAGE;
-	vreg->desc.owner = THIS_MODULE;
-	vreg->desc.ops = &rpmh_regulator_ops;
-
-	config.dev = &pdev->dev;
-	config.driver_data = vreg;
-	config.of_node = pdev->dev.of_node;
-
-	vreg->rdev = devm_regulator_register(&pdev->dev,
-					     &vreg->desc, &config);
-	if (IS_ERR(vreg->rdev))
-		return PTR_ERR(vreg->rdev);
-
-	ret = device_create_file(&vreg->rdev->dev, &dev_attr_uv_override);
+	ret = of_property_read_string(dev->of_node, "regulator-name",
+				      &name);
 	if (ret)
 		return ret;
 
-	return 0;
-}
+	vreg = devm_kzalloc(dev, sizeof(*vreg), GFP_KERNEL);
+	if (!vreg)
+		return -ENOMEM;
 
-static int rpmh_regulator_remove(struct platform_device *pdev)
-{
-	struct rpmh_vreg *vreg = platform_get_drvdata(pdev);
+	rdesc = devm_kzalloc(dev, sizeof(*rdesc), GFP_KERNEL);
+	if (!rdesc)
+		return -ENOMEM;
 
-	device_remove_file(&vreg->rdev->dev, &dev_attr_uv_override);
+	vreg->dev = dev;
+	vreg->name = name;
+	vreg->uv_override = -1;
+
+	vreg->res = rpmh_get_byname(dev, name);
+	if (IS_ERR(vreg->res))
+		return PTR_ERR(vreg->res);
+
+	rdesc->name = name;
+	rdesc->ops = &rpmh_regulator_ops;
+	rdesc->type = REGULATOR_VOLTAGE;
+	rdesc->owner = THIS_MODULE;
+
+	config.dev = dev;
+	config.driver_data = vreg;
+	config.of_node = dev->of_node;
+
+	vreg->rdev = devm_regulator_register(dev, rdesc, &config);
+	if (IS_ERR(vreg->rdev))
+		return PTR_ERR(vreg->rdev);
+
+	device_create_file(&vreg->rdev->dev, &dev_attr_uv_override);
+
+	dev_info(dev, "Registered RPMh regulator %s (uv_override enabled)\n",
+		 name);
+
 	return 0;
 }
 
@@ -194,15 +215,14 @@ static const struct of_device_id rpmh_regulator_match[] = {
 MODULE_DEVICE_TABLE(of, rpmh_regulator_match);
 
 static struct platform_driver rpmh_regulator_driver = {
-	.probe  = rpmh_regulator_probe,
-	.remove = rpmh_regulator_remove,
+	.probe = rpmh_regulator_probe,
 	.driver = {
-		.name = "rpmh-regulator",
+		.name = "qcom-rpmh-regulator",
 		.of_match_table = rpmh_regulator_match,
 	},
 };
 
 module_platform_driver(rpmh_regulator_driver);
 
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RPMh regulator driver with uv_override");
+MODULE_DESCRIPTION("Qualcomm RPMh regulator driver with uv_override");
+MODULE_LICENSE("GPL v2");
