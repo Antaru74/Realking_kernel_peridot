@@ -123,20 +123,20 @@ jobs:
             zip
 
       # ====== TOOLCHAIN ======
-      - name: Download AOSP Clang (yaosp)
+      - name: Clone AOSP Clang
         run: |
           mkdir -p toolchains
           cd toolchains
 
-          curl -L -o clang.tar.gz \
-          "https://gitlab.com/yaosp/prebuilts_clang_host_linux-x86/-/archive/fourteen/prebuilts_clang_host_linux-x86-fourteen.tar.gz?path=clang-r487747c"
-
-          tar -xf clang.tar.gz
-
-          CLANG_DIR=$(find . -type d -name "clang-r487747c" | head -n 1)
-
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+          --depth 1 \
+          --single-branch \
+          -b main
          
+          CLANG_DIR=$(ls -d linux-x86/clang-r*/bin | sort -V | tail -n 1 | xargs dirname)
+
           echo "CLANG_PATH=$PWD/$CLANG_DIR/bin" >> $GITHUB_ENV
+
 
 
 
