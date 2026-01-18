@@ -172,6 +172,7 @@ jobs:
           mkdir -p artifacts
           cp ${OUT_DIR}/arch/arm64/boot/Image artifacts/ || true
           cp ${OUT_DIR}/arch/arm64/boot/Image.lz4 artifacts/ || true
+          cp ${OUT_DIR}/drivers/regulator/rpmh-regulator.ko artifacts/ || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
