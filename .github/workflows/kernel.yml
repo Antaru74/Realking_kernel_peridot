@@ -133,9 +133,8 @@ jobs:
           --single-branch \
           -b main
          
-          CLANG_DIR=$(ls -d linux-x86/clang-r*/bin | sort -V | tail -n 1 | xargs dirname)
+          echo "CLANG_PATH=$PWD/linux-x86/clang-r510928/bin" >> $GITHUB_ENV
 
-          echo "CLANG_PATH=$PWD/$CLANG_DIR/bin" >> $GITHUB_ENV
 
 
 
