@@ -127,6 +127,7 @@ jobs:
       # ====== BUILD ======
       - name: Kernel defconfig (GKI)
         run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           make clean && make mrproper
           mkdir -p ${OUT_DIR}
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
