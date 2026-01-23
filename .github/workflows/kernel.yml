@@ -149,7 +149,7 @@ jobs:
         run: |
           make clean && make mrproper
           mkdir -p ${OUT_DIR}
-          rm -f .config
+          
 
           # Base defconfig
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
