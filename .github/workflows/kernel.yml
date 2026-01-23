@@ -15,7 +15,7 @@ jobs:
       ARCH: arm64
       SUBARCH: arm64
       OUT_DIR: out
-      DEFCONFIG: gki_defconfig
+      DEFCONFIG: peridot_defconfig
       CLANG_VERSION: r487747
 
     steps:
@@ -148,21 +148,21 @@ jobs:
       - name: Kernel defconfig + merge pineapple configs
         run: |
           make clean && make mrproper
-          make ARCH=arm64 mrproper
           mkdir -p ${OUT_DIR}
+          rm -f .config
 
           # Base defconfig
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
 
           # Merge vendor configs (Snapdragon 8 Gen 3)
-          scripts/kconfig/merge_config.sh -m ${OUT_DIR}/.config \
-            arch/arm64/configs/vendor/pineapple_GKI.config \
-            arch/arm64/configs/vendor/pineapple_consolidate.config \
-            arch/arm64/configs/vendor/pineapple_le.config \
-            arch/arm64/configs/vendor/pineapple_tuivm.config
+          scripts/kconfig/merge_config.sh -m \
+           out/.config \
+           arch/arm64/configs/vendor/pineapple_GKI.config \
+           arch/arm64/configs/vendor/pineapple_consolidate.config \
+           arch/arm64/configs/vendor/pineapple_le.config \
+           arch/arm64/configs/vendor/pineapple_tuivm.config
 
-          # Resolve Kconfig deps
-          make O=${OUT_DIR} ARCH=arm64 olddefconfig
+          make O=out ARCH=arm64 olddefconfig
 
       - name: Build GKI kernel
         run: |
