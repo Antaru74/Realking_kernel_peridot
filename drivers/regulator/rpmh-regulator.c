@@ -25,6 +25,22 @@
 
 #include <dt-bindings/regulator/qcom,rpmh-regulator-levels.h>
 
+static ssize_t uv_override_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf);
+static ssize_t uv_override_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count);
+
+static struct device_attribute dev_attr_uv_override = {
+	.attr = {
+		.name = "uv_override",
+		.mode = 0666,   /* ← 超重要 */
+	},
+	.show  = uv_override_show,
+	.store = uv_override_store,
+};
+
 /**
  * enum rpmh_regulator_type - supported RPMh accelerator types
  * %RPMH_REGULATOR_TYPE_VRM:	RPMh VRM accelerator which supports voting on
@@ -1120,6 +1136,15 @@ static int rpmh_regulator_pbs_enable(struct regulator_dev *rdev)
 	mutex_unlock(&vreg->aggr_vreg->lock);
 
 	return rc;
+}
+
+static void rpmh_add_uv_override_sysfs(struct rpmh_vreg *vreg)
+{
+	int rc;
+
+	rc = device_create_file(&vreg->rdev->dev, &dev_attr_uv_override);
+	if (rc)
+		vreg_err(vreg, "failed to create uv_override sysfs\n");
 }
 
 /**
@@ -2281,36 +2306,39 @@ static ssize_t uv_override_store(struct device *dev,
 				 const char *buf, size_t count)
 {
 	struct regulator_dev *rdev =
-        container_of(dev, struct regulator_dev, dev);
-	int uv, rc;
+		container_of(dev, struct regulator_dev, dev);
+	int uv;
+	int rc;
 
 	if (kstrtoint(buf, 10, &uv))
 		return -EINVAL;
 
+	/*
+	 * regulator framework を通さず、
+	 * VRM に直接投げる（min/max 無視）
+	 */
 	rc = rpmh_regulator_vrm_set_voltage(rdev, uv, uv, NULL);
-	if (rc)
+	if (rc) {
+		dev_err(dev, "uv_override set failed: %d\n", rc);
 		return rc;
+	}
 
 	return count;
 }
+
 
 static ssize_t uv_override_show(struct device *dev,
 				struct device_attribute *attr,
 				char *buf)
 {
 	struct regulator_dev *rdev =
-        container_of(dev, struct regulator_dev, dev);        
-	int uv = rpmh_regulator_vrm_get_voltage(rdev);
+		container_of(dev, struct regulator_dev, dev);
+	int uv;
 
+	uv = rpmh_regulator_vrm_get_voltage(rdev);
 	return scnprintf(buf, PAGE_SIZE, "%d\n", uv);
 }
 
-static DEVICE_ATTR_RW(uv_override);
-
-static void rpmh_add_uv_override_sysfs(struct rpmh_vreg *vreg)
-{
-	device_create_file(&vreg->rdev->dev, &dev_attr_uv_override);
-}
 
 static struct platform_driver rpmh_regulator_driver = {
 	.driver = {
