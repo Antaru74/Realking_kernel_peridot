@@ -148,6 +148,7 @@ jobs:
       - name: Kernel defconfig + merge pineapple configs
         run: |
           make clean && make mrproper
+          make ARCH=arm64 mrproper
           mkdir -p ${OUT_DIR}
 
           # Base defconfig
