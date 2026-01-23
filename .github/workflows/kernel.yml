@@ -118,18 +118,18 @@ jobs:
             zip
 
       # ====== TOOLCHAIN ======
-      - name: Clone AOSP Clang (r487747c)
+      - name: Clone AOSP Clang
         run: |
-         mkdir -p toolchains
-         cd toolchains
+          mkdir -p toolchains
+          cd toolchains
 
-         git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-         --depth 1 \
-         --single-branch \
-         -b main
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            --depth 1 \
+            --single-branch \
+            -b main
 
-         CLANG_DIR=linux-x86/clang-r487747c
-         echo "CLANG_PATH=$PWD/$CLANG_DIR/bin" >> $GITHUB_ENV
+          CLANG_DIR=$(ls -d linux-x86/clang-r*/bin | sort -V | tail -n 1 | xargs dirname)
+          echo "CLANG_PATH=$PWD/$CLANG_DIR/bin" >> $GITHUB_ENV
 
       - name: Setup LLVM environment
         run: |
