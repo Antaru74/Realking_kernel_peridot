@@ -6,7 +6,6 @@
 
 #include <linux/bitops.h>
 #include <linux/err.h>
-#include <linux/device.h>
 #include <linux/ipc_logging.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -2281,7 +2280,8 @@ static ssize_t uv_override_store(struct device *dev,
 				 struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	struct regulator_dev *rdev = rdev_get_drvdata(dev);
+	struct regulator_dev *rdev =
+        container_of(dev, struct regulator_dev, dev);
 	int uv, rc;
 
 	if (kstrtoint(buf, 10, &uv))
@@ -2298,7 +2298,8 @@ static ssize_t uv_override_show(struct device *dev,
 				struct device_attribute *attr,
 				char *buf)
 {
-	struct regulator_dev *rdev = rdev_get_drvdata(dev);
+	struct regulator_dev *rdev =
+        container_of(dev, struct regulator_dev, dev);        
 	int uv = rpmh_regulator_vrm_get_voltage(rdev);
 
 	return scnprintf(buf, PAGE_SIZE, "%d\n", uv);
