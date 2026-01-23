@@ -6,6 +6,7 @@
 
 #include <linux/bitops.h>
 #include <linux/err.h>
+#include <linux/device.h>
 #include <linux/ipc_logging.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
