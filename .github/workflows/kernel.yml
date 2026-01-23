@@ -154,6 +154,8 @@ jobs:
           # Base defconfig
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
 
+          export KCONFIG_CONFIG=out/.config
+
           # Merge vendor configs (Snapdragon 8 Gen 3)
           scripts/kconfig/merge_config.sh -m \
            out/.config \
