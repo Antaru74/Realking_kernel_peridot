@@ -15,7 +15,7 @@ jobs:
       ARCH: arm64
       SUBARCH: arm64
       OUT_DIR: out
-      DEFCONFIG: peridot_defconfig
+      DEFCONFIG: gki_defconfig
       CLANG_VERSION: r487747
 
     steps:
