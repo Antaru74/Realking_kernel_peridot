@@ -154,7 +154,7 @@ jobs:
           # Base defconfig
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
 
-          export KCONFIG_CONFIG=out/.config
+          cd out
 
           # Merge vendor configs (Snapdragon 8 Gen 3)
           scripts/kconfig/merge_config.sh -m \
@@ -164,6 +164,7 @@ jobs:
            arch/arm64/configs/vendor/pineapple_le.config \
            arch/arm64/configs/vendor/pineapple_tuivm.config
 
+          cd ..
           make O=out ARCH=arm64 olddefconfig
 
       - name: Build GKI kernel
