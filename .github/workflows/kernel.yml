@@ -31,25 +31,20 @@ jobs:
           set +e
           echo "== KernelSU auto-uninstall =="
 
-          # Remove KernelSU source dir if exists
           rm -rf drivers/kernelsu
 
-          # Clean drivers/Kconfig
           if [ -f drivers/Kconfig ]; then
             sed -i '/kernelsu/d' drivers/Kconfig
           fi
 
-          # Clean drivers/Makefile
           if [ -f drivers/Makefile ]; then
             sed -i '/kernelsu/d' drivers/Makefile
           fi
 
-          # Clean top-level Makefile
           if [ -f Makefile ]; then
             sed -i '/kernelsu/d' Makefile
           fi
 
-          # Clean any leftover configs
           find . -type f \( -name "Kconfig" -o -name "Makefile" \) \
             -exec sed -i '/kernelsu/d' {} +
 
@@ -129,16 +124,12 @@ jobs:
           cd toolchains
 
           git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-          --depth 1 \
-          --single-branch \
-          -b main
-         
+            --depth 1 \
+            --single-branch \
+            -b main
+
           CLANG_DIR=$(ls -d linux-x86/clang-r*/bin | sort -V | tail -n 1 | xargs dirname)
-
           echo "CLANG_PATH=$PWD/$CLANG_DIR/bin" >> $GITHUB_ENV
-
-
-
 
       - name: Setup LLVM environment
         run: |
@@ -154,17 +145,27 @@ jobs:
           echo "LLVM_IAS=1" >> $GITHUB_ENV
 
       # ====== BUILD ======
-      - name: Kernel defconfig (GKI)
+      - name: Kernel defconfig + merge pineapple configs
         run: |
           make clean && make mrproper
           mkdir -p ${OUT_DIR}
+
+          # Base defconfig
           make O=${OUT_DIR} ARCH=arm64 ${DEFCONFIG}
+
+          # Merge vendor configs (Snapdragon 8 Gen 3)
+          scripts/kconfig/merge_config.sh -m ${OUT_DIR}/.config \
+            arch/arm64/configs/vendor/pineapple_GKI.config \
+            arch/arm64/configs/vendor/pineapple_consolidate.config \
+            arch/arm64/configs/vendor/pineapple_le.config \
+            arch/arm64/configs/vendor/pineapple_tuivm.config
+
+          # Resolve Kconfig deps
+          make O=${OUT_DIR} ARCH=arm64 olddefconfig
 
       - name: Build GKI kernel
         run: |
-          make O=${OUT_DIR} \
-            ARCH=arm64 \
-            -j$(nproc)
+          make O=${OUT_DIR} ARCH=arm64 -j$(nproc)
 
       # ====== ARTIFACT ======
       - name: Collect artifacts
