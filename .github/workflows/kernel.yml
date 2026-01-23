@@ -159,10 +159,7 @@ jobs:
           # Merge vendor configs (Snapdragon 8 Gen 3)
           scripts/kconfig/merge_config.sh -m \
            out/.config \
-           arch/arm64/configs/vendor/pineapple_GKI.config \
-           arch/arm64/configs/vendor/pineapple_consolidate.config \
-           arch/arm64/configs/vendor/pineapple_le.config \
-           arch/arm64/configs/vendor/pineapple_tuivm.config
+           arch/arm64/configs/vendor/pineapple_GKI.config 
 
           make O=out ARCH=arm64 olddefconfig
 
