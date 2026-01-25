@@ -24,10 +24,6 @@
 #include <linux/soc/qcom/battery_charger.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
 
-/* Forward declaration */
-static int battery_set_bypass_mode(struct battery_chg_dev *bcdev, bool enable);
-
-
 #define MSG_OWNER_BC			32778
 #define MSG_TYPE_REQ_RESP		1
 #define MSG_TYPE_NOTIFY			2
@@ -297,6 +293,8 @@ struct battery_chg_dev {
 // [追加: 次の行に挿入]
 	bool				bypass_mode; // Added for Bypass Charging
 };
+
+static int battery_set_bypass_mode(struct battery_chg_dev *bcdev, bool enable);
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
 	[BATT_STATUS]		= POWER_SUPPLY_PROP_STATUS,
