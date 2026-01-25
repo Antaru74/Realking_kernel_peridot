@@ -290,6 +290,8 @@ struct battery_chg_dev {
 	bool				notify_en;
 	bool				error_prop;
 	unsigned int			num_usb_ports;
+// [追加: 次の行に挿入]
+	bool				bypass_mode; // Added for Bypass Charging
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -811,6 +813,15 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 		if (rc < 0) {
 			pr_err("Failed to read USB_ADAP_TYPE rc=%d\n", rc);
 			continue;
+		}
+		
+		/* バイパスモード中にUSBが抜かれたかチェック */
+		if (bcdev->bypass_mode) {
+			int rc_online = read_property_id(bcdev, pst, USB_ONLINE);
+			if (!rc_online && !pst->prop[USB_ONLINE]) {
+				pr_info("USB unplugged detected, disabling bypass mode.\n");
+				battery_set_bypass_mode(bcdev, false);
+			}
 		}
 
 		/* Reset usb_icl_ua whenever USB adapter type changes */
@@ -1415,6 +1426,37 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+// [挿入]
+static int battery_set_bypass_mode(struct battery_chg_dev *bcdev, bool enable)
+{
+	int rc;
+
+	/* バイパス有効時: 充電を無効化 (0) */
+	/* バイパス解除時: 充電を有効化 (1) */
+	int chg_en = enable ? 0 : 1;
+
+	/* ハードウェアへ充電有効/無効設定を送信 */
+	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
+				BATT_CHG_CTRL_EN, chg_en);
+
+	if (rc < 0) {
+		pr_err("Failed to set bypass mode (chg_en=%d), rc=%d\n", chg_en, rc);
+		return rc;
+	}
+
+	bcdev->bypass_mode = enable;
+	bcdev->chg_ctrl_en = chg_en; /* 内部変数の同期 */
+
+	pr_info("Bypass mode set to %d (Hardware Charging: %s)\n",
+		enable, chg_en ? "Enabled" : "Disabled");
+
+	/* UI更新のために通知を送る */
+	if (bcdev->psy_list[PSY_TYPE_BATTERY].psy)
+		power_supply_changed(bcdev->psy_list[PSY_TYPE_BATTERY].psy);
+
+	return rc;
+}
+
 static int battery_psy_get_prop(struct power_supply *psy,
 		enum power_supply_property prop,
 		union power_supply_propval *pval)
@@ -1439,6 +1481,12 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	rc = read_property_id(bcdev, pst, prop_id);
 	if (rc < 0)
 		return rc;
+		
+		/* Bypass ModeかつSTATUS要求の時は、ハードウェアがNot ChargingでもChargingと偽装する */
+	if (bcdev->bypass_mode && prop == POWER_SUPPLY_PROP_STATUS) {
+		pval->intval = POWER_SUPPLY_STATUS_CHARGING;
+		return 0;
+	}
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_MODEL_NAME:
@@ -2049,6 +2097,40 @@ static ssize_t charge_control_en_show(struct class *c,
 }
 static CLASS_ATTR_RW(charge_control_en);
 
+
+// [挿入]
+static ssize_t bypass_charger_store(struct class *c,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	bool val;
+	int rc;
+
+	if (kstrtobool(buf, &val))
+		return -EINVAL;
+
+	// すでに同じ状態なら何もしない
+	if (bcdev->bypass_mode == val)
+		return count;
+
+	rc = battery_set_bypass_mode(bcdev, val);
+	if (rc < 0)
+		return rc;
+
+	return count;
+}
+
+static ssize_t bypass_charger_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->bypass_mode);
+}
+static CLASS_ATTR_RW(bypass_charger);
+
 QTI_CHARGER_RO_SHOW(usb_typec_compliant, PSY_TYPE_USB, USB_TYPEC_COMPLIANT);
 
 QTI_CHARGER_RO_SHOW(usb_num_ports, PSY_TYPE_USB, USB_NUM_PORTS);
@@ -2236,6 +2318,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_usb_real_type.attr,
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charger.attr, // Added
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class);
@@ -2264,6 +2347,7 @@ static struct attribute *battery_class_usb_2_attrs[] = {
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charger.attr, // Added
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_usb_2);
@@ -2281,6 +2365,7 @@ static struct attribute *battery_class_no_wls_attrs[] = {
 	&class_attr_usb_typec_compliant.attr,
 	&class_attr_usb_num_ports.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charger.attr, // Added
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_no_wls);
@@ -2302,6 +2387,7 @@ static struct attribute *battery_class_usb_2_no_wls_attrs[] = {
 	&class_attr_usb_num_ports.attr,
 	&class_attr_usb_2_typec_compliant.attr,
 	&class_attr_charge_control_en.attr,
+	&class_attr_bypass_charger.attr, // Added
 	NULL,
 };
 ATTRIBUTE_GROUPS(battery_class_usb_2_no_wls);
