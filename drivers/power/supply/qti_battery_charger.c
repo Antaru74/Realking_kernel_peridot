@@ -24,6 +24,10 @@
 #include <linux/soc/qcom/battery_charger.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
 
+/* Forward declaration */
+static int battery_set_bypass_mode(struct battery_chg_dev *bcdev, bool enable);
+
+
 #define MSG_OWNER_BC			32778
 #define MSG_TYPE_REQ_RESP		1
 #define MSG_TYPE_NOTIFY			2
@@ -992,7 +996,7 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 	down_read(&bcdev->state_sem);
 	if (!bcdev->initialized) {
 		pr_debug("Driver initialization failed: Dropping glink callback message: state %d\n",
-			 bcdev->state);
+         atomic_read(&bcdev->state));
 		up_read(&bcdev->state_sem);
 		return 0;
 	}
