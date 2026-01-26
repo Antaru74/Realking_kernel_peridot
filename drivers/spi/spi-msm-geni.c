@@ -23,6 +23,7 @@
 #include <linux/suspend.h>
 #include <linux/bootmarker_kernel.h>
 
+#define START_TRIGGER 0x1
 #define SPI_NUM_CHIPSELECT	(4)
 #define SPI_XFER_TIMEOUT_MS	(250)
 #define SPI_AUTO_SUSPEND_DELAY	(250)
