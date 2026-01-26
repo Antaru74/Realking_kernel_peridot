@@ -29,6 +29,11 @@
 #include "rpmsg_internal.h"
 #include "qcom_glink_native.h"
 
+/* 足りない定義をここに追加 */
+#ifndef RPM_VERSION_1
+#define RPM_VERSION_1 1
+#endif
+
 #define GLINK_LOG_PAGE_CNT 32
 #define GLINK_INFO(ctxt, x, ...)					  \
 	ipc_log_string(ctxt, "[%s]: "x, __func__, ##__VA_ARGS__)
