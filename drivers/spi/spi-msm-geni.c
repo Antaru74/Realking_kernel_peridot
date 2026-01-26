@@ -2623,13 +2623,14 @@ static int spi_geni_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* 64bitを試して、ダメなら32bitにする標準的な書き方 */
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-	if (ret) {
+	if (ret)
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (ret) {
-			dev_err(&pdev->dev, "could not set DMA mask\n");
-			goto spi_geni_probe_err;
-		}
+
+	if (ret) {
+		dev_err(&pdev->dev, "could not set DMA mask\n");
+		goto spi_geni_probe_err;
 	}
 
 	if (of_property_read_u32(pdev->dev.of_node, "spi-max-frequency",
