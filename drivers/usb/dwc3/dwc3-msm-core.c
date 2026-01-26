@@ -4371,7 +4371,7 @@ static int dwc3_msm_suspend(struct dwc3_msm *mdwc, bool force_power_collapse)
 	      mdwc->in_restart || force_power_collapse)
 		mdwc->lpm_flags |= MDWC3_POWER_COLLAPSE;
 
-	ret = __dwc3_msm_suspend(mdwc);
+	ret = dwc3_msm_suspend(mdwc, true);
 	if (ret < 0) {
 		mutex_unlock(&mdwc->suspend_resume_mutex);
 		return ret;
@@ -6530,6 +6530,7 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 	struct device	*dev = &pdev->dev;
 	struct dwc3_msm *mdwc;
 	int ret = 0, i;
+	struct resource *res; 
 	u32 val;
 
 	mdwc = devm_kzalloc(&pdev->dev, sizeof(*mdwc), GFP_KERNEL);
