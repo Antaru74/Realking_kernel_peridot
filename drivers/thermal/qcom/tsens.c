@@ -659,31 +659,40 @@ int get_temp_tsens_valid(const struct tsens_sensor *s, int *temp)
 	u32 valid;
 	int ret;
 
+	#define CPU_THERMAL_OFFSET 5000   /* +5.0°C (millidegree) */
+
 	if (s->cached_temp != INT_MIN) {
 		*temp = s->cached_temp;
 		goto dump_and_exit;
 	}
 
 	/* VER_0 doesn't have VALID bit */
-	if (tsens_version(priv) == VER_0)
-		goto get_temp;
+	if (tsens_version(priv) == VER_0) {
+		ret = tsens_read(priv, temp_idx, temp);
+		if (ret)
+			return ret;
+	} else {
+		ret = tsens_read(priv, valid_idx, &valid);
+		if (ret)
+			return ret;
 
-	/* Valid bit is 0 for 6 AHB clock cycles.
-	 * At 19.2MHz, 1 AHB clock is ~60ns.
-	 * We should enter this loop very, very rarely.
-	 * Wait 1 us since it's the min of poll_timeout macro.
-	 * Old value was 400 ns.
-	 */
-	ret = regmap_field_read_poll_timeout(priv->rf[valid_idx], valid,
-					     valid, 1, 20 * USEC_PER_MSEC);
-	if (ret)
-		return ret;
+		if (!valid)
+			return -EAGAIN;
 
-get_temp:
-	/* Valid bit is set, OK to read the temperature */
-	*temp = tsens_hw_to_mC(s, temp_idx);
+		ret = tsens_read(priv, temp_idx, temp);
+		if (ret)
+			return ret;
+	}
 
-	/* Save temperature data to minidump */
+	/* ===== CPU ONLY THERMAL OFFSET (+5°C) ===== */
+	if (s->tzd && s->tzd->type) {
+		/* thermal zone名に "cpu" を含むものだけ補正 */
+		if (strstr(s->tzd->type, "cpu")) {
+			*temp += CPU_THERMAL_OFFSET;
+		}
+	}
+	/* ========================================= */
+
 	if (s->priv->tsens_md && s->tzd)
 		thermal_minidump_update_data(s->priv->tsens_md,
 			s->tzd->type, temp);
@@ -697,6 +706,7 @@ dump_and_exit:
 
 	return 0;
 }
+
 
 int get_temp_common(const struct tsens_sensor *s, int *temp)
 {
