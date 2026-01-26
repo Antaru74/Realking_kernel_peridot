@@ -653,6 +653,10 @@ struct dwc3_msm {
 
 	int repeater_rev;
 	bool force_disconnect;
+	/* 追加分: Power Domain (PD) 管理用のメンバ */
+	bool			fw_managed_pwr;
+	int			pd_count;
+	struct device		**pd_devs;
 };
 
 #define USB_HSPHY_3P3_VOL_MIN		3050000 /* uV */
