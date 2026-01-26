@@ -50,7 +50,7 @@
 #include <linux/usb/composite.h>
 #include <linux/soc/qcom/wcd939x-i2c.h>
 #include <linux/usb/repeater.h>
-#include "../../misc/hwid/hwid.h"
+// #include "../../misc/hwid/hwid.h"
 
 #include "core.h"
 #include "gadget.h"
