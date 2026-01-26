@@ -668,18 +668,18 @@ int get_temp_tsens_valid(const struct tsens_sensor *s, int *temp)
 
 	/* VER_0 doesn't have VALID bit */
 	if (tsens_version(priv) == VER_0) {
-		ret = tsens_read(priv, temp_idx, temp);
+		ret = priv->ops->get_temp(priv, temp_idx, temp);
 		if (ret)
 			return ret;
 	} else {
-		ret = tsens_read(priv, valid_idx, &valid);
+		ret = priv->ops->get_temp(priv, valid_idx, &valid);
 		if (ret)
 			return ret;
 
 		if (!valid)
 			return -EAGAIN;
 
-		ret = tsens_read(priv, temp_idx, temp);
+		ret = priv->ops->get_temp(priv, temp_idx, temp);		
 		if (ret)
 			return ret;
 	}
