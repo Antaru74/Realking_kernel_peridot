@@ -659,44 +659,31 @@ int get_temp_tsens_valid(const struct tsens_sensor *s, int *temp)
 	u32 valid;
 	int ret;
 
-	#define CPU_THERMAL_OFFSET 5000   /* +5.0°C (millidegree) */
-
 	if (s->cached_temp != INT_MIN) {
 		*temp = s->cached_temp;
 		goto dump_and_exit;
 	}
 
 	/* VER_0 doesn't have VALID bit */
-	if (tsens_version(priv) == VER_0) {
-		*temp = priv->ops->get_temp(priv, temp_idx);
-ret = 0;
-		if (ret)
-			return ret;
-	} else {
-		valid = priv->ops->get_temp(priv, valid_idx);
-ret = 0;
+	if (tsens_version(priv) == VER_0)
+		goto get_temp;
 
-		if (ret)
-			return ret;
+	/* Valid bit is 0 for 6 AHB clock cycles.
+	 * At 19.2MHz, 1 AHB clock is ~60ns.
+	 * We should enter this loop very, very rarely.
+	 * Wait 1 us since it's the min of poll_timeout macro.
+	 * Old value was 400 ns.
+	 */
+	ret = regmap_field_read_poll_timeout(priv->rf[valid_idx], valid,
+					     valid, 1, 20 * USEC_PER_MSEC);
+	if (ret)
+		return ret;
 
-		if (!valid)
-			return -EAGAIN;
+get_temp:
+	/* Valid bit is set, OK to read the temperature */
+	*temp = tsens_hw_to_mC(s, temp_idx);
 
-		*temp = priv->ops->get_temp(priv, temp_idx);
-ret = 0;
-		if (ret)
-			return ret;
-	}
-
-	/* ===== CPU ONLY THERMAL OFFSET (+5°C) ===== */
-	if (s->tzd && s->tzd->type) {
-		/* thermal zone名に "cpu" を含むものだけ補正 */
-		if (strstr(s->tzd->type, "cpu")) {
-			*temp += CPU_THERMAL_OFFSET;
-		}
-	}
-	/* ========================================= */
-
+	/* Save temperature data to minidump */
 	if (s->priv->tsens_md && s->tzd)
 		thermal_minidump_update_data(s->priv->tsens_md,
 			s->tzd->type, temp);
@@ -710,7 +697,6 @@ dump_and_exit:
 
 	return 0;
 }
-
 
 int get_temp_common(const struct tsens_sensor *s, int *temp)
 {
@@ -1335,7 +1321,7 @@ static void tsens_thermal_zone_trip_update(struct thermal_zone_device *tz,
 	if (tz->trips[trip_id].type == THERMAL_TRIP_HOT)
 		trip_delta = TSENS_ELEVATE_HOT_DELTA;
 	else if (strnstr(tz->type, "cpu", sizeof(tz->type)))
-		trip_delta = TSENS_ELEVATE_CPU_DELTA;
+		trip_delta = 5000; /* FORCE +5 DegC (5000 millidegrees) */
 	else
 		trip_delta = TSENS_ELEVATE_DELTA;
 
@@ -1418,9 +1404,11 @@ static int tsens_register(struct tsens_priv *priv)
 		if (devm_thermal_add_hwmon_sysfs(tzd))
 			dev_warn(priv->dev,
 				 "Failed to add hwmon sysfs attributes\n");
-		/* update tsens trip based on fuse register */
-		if (priv->need_trip_update)
+		
+		/* update tsens trip based on fuse register OR force for CPU */
+		if (priv->need_trip_update || strnstr(tzd->type, "cpu", sizeof(tzd->type)))
 			ret = tsens_nvmem_trip_update(tzd);
+			
 		qti_update_tz_ops(tzd, true);
 	}
 
