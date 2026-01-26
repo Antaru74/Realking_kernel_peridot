@@ -175,6 +175,8 @@ jobs:
           cp ${OUT_DIR}/arch/arm64/boot/Image.lz4 artifacts/ || true
           cp ${OUT_DIR}/drivers/regulator/rpmh-regulator.ko artifacts/ || true
           cp ${OUT_DIR}/drivers/power/supply/qti_battery_charger.ko artifacts/ || true
+          cp ${OUT_DIR}/drivers/thermal/qcom/qcom_tsens.ko artifacts/ || true
+
 
 
       - name: Upload artifacts
