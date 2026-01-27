@@ -397,7 +397,8 @@ void usb_notifier(void *priv, unsigned int event, struct qdss_request *d_req,
 			if (ret < 0)
 				return;
 
-			usb_qdss_alloc_req(ch, USB_BUF_NUM);
+			/* 3つ目の引数に 0（または必要な数）を追加 */
+			usb_qdss_alloc_req(ch, USB_BUF_NUM, 0);
 			queue_work(drvdata->byte_cntr->usb_wq, &(drvdata->byte_cntr->read_work));
 		}
 		break;
