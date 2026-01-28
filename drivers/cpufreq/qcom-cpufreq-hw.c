@@ -331,9 +331,16 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		if (i == 0)
 			max_cc = core_count;
 
+		u32 volt_idx = i;
+
+/* 常に一段下の電圧テーブルを使う（最下段はそのまま） */
+		if (i > 0)
+			volt_idx = i - 1;
+
 		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
-				      i * soc_data->lut_row_size);
+		      volt_idx * soc_data->lut_row_size);
 		volt = FIELD_GET(LUT_VOLT, data) * 1000;
+
 
 		if (src)
 			freq = xo_rate * lval / 1000;
