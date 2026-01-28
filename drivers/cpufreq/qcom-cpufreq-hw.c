@@ -331,14 +331,34 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		if (i == 0)
 			max_cc = core_count;
 
+		u32 data_cur, data_adj;
+		u32 volt_cur, volt_adj;
 		u32 volt_idx = i;
 
-/* 常に一段下の電圧テーブルを使う（最下段はそのまま） */
-		if (i > 0)
-			volt_idx = i - 1;
+/* 現在の電圧を取得 */
+		data_cur = readl_relaxed(drv_data->base +
+					 soc_data->reg_volt_lut +
+					 i * soc_data->lut_row_size);
+		volt_cur = FIELD_GET(LUT_VOLT, data_cur);
 
-		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
-		      volt_idx * soc_data->lut_row_size);
+/*
+ * 1つ下の index を候補として読み、
+ * 本当に電圧が下がる場合のみ採用する
+ */
+		if (i > 0) {
+			data_adj = readl_relaxed(drv_data->base +
+						 soc_data->reg_volt_lut +
+						 (i - 1) * soc_data->lut_row_size);
+			volt_adj = FIELD_GET(LUT_VOLT, data_adj);
+
+			if (volt_adj < volt_cur)
+				volt_idx = i - 1;
+		}
+
+/* 最終的に選ばれた index で電圧を取得 */
+		data = readl_relaxed(drv_data->base +
+				     soc_data->reg_volt_lut +
+				     volt_idx * soc_data->lut_row_size);
 		volt = FIELD_GET(LUT_VOLT, data) * 1000;
 
 
