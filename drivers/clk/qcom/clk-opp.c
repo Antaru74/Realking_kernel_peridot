@@ -166,6 +166,14 @@ void clk_hw_populate_clock_opp_table(struct device_node *np, struct clk_hw *hw)
 		if (uv < 0)
 			goto err_derive_device_list;
 
+/* ---- 30mV Undervolt ---- */
+if (uv > 30000)
+    uv -= 30000;
+else
+    pr_warn("%s: UV skipped, voltage too low (%d uV)\n",
+            clk_hw_get_name(hw), uv);
+/* ------------------------- */
+
 		ret = clk_add_and_print_opp(hw, device_list, count,
 							rate, uv, n);
 		if (ret)
