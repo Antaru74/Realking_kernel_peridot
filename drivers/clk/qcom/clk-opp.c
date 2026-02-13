@@ -70,25 +70,43 @@ static int clk_get_voltage(struct clk_hw *hw, unsigned long rate, int n)
 }
 
 static int clk_add_and_print_opp(struct clk_hw *hw,
-				struct device **device_list, int count,
-				unsigned long rate, int uv, int n)
+                struct device **device_list, int count,
+                unsigned long rate, int uv, int n)
 {
-	int j, ret;
+    int j, ret;
 
-	for (j = 0; j < count; j++) {
-		ret = dev_pm_opp_add(device_list[j], rate, uv);
-		if (ret) {
-			pr_err("%s: couldn't add OPP for %lu - err: %d\n",
-						clk_hw_get_name(hw), rate, ret);
-			return ret;
-		}
+    for (j = 0; j < count; j++) {
 
-		pr_info("%s: set OPP pair(%lu Hz: %u uV) on %s\n",
-						clk_hw_get_name(hw), rate, uv,
-						dev_name(device_list[j]));
-	}
-	return 0;
+        int new_uv = uv;
+
+        /* ---- CPUだけ30mV Undervolt ---- */
+        if (device_list[j]->of_node &&
+            device_list[j]->of_node->parent &&
+            !strcmp(device_list[j]->of_node->parent->name, "cpus")) {
+
+            if (uv > 30000)
+                new_uv = uv - 30000;
+
+            pr_info("CPU UV applied: %s %lu Hz -> %d uV\n",
+                    dev_name(device_list[j]), rate, new_uv);
+        }
+        /* -------------------------------- */
+
+        ret = dev_pm_opp_add(device_list[j], rate, new_uv);
+        if (ret) {
+            pr_err("%s: couldn't add OPP for %lu - err: %d\n",
+                    clk_hw_get_name(hw), rate, ret);
+            return ret;
+        }
+
+        pr_info("%s: set OPP pair(%lu Hz: %u uV) on %s\n",
+                clk_hw_get_name(hw), rate, new_uv,
+                dev_name(device_list[j]));
+    }
+
+    return 0;
 }
+
 
 void clk_hw_populate_clock_opp_table(struct device_node *np, struct clk_hw *hw)
 {
@@ -165,14 +183,6 @@ void clk_hw_populate_clock_opp_table(struct device_node *np, struct clk_hw *hw)
 		uv = clk_get_voltage(hw, rate, n);
 		if (uv < 0)
 			goto err_derive_device_list;
-
-/* ---- 30mV Undervolt ---- */
-if (uv > 30000)
-    uv -= 30000;
-else
-    pr_warn("%s: UV skipped, voltage too low (%d uV)\n",
-            clk_hw_get_name(hw), uv);
-/* ------------------------- */
 
 		ret = clk_add_and_print_opp(hw, device_list, count,
 							rate, uv, n);
