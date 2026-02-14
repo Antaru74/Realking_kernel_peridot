@@ -296,7 +296,7 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 	struct qcom_cpufreq_data *drv_data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = drv_data->soc_data;
 
-	table = kcalloc(soc_data->lut_max_entries + 1, sizeof(*table), GFP_KERNEL);
+	table = kcalloc(soc_data->lut_max_entries + 2, sizeof(*table), GFP_KERNEL);
 	if (!table)
 		return -ENOMEM;
 
@@ -419,6 +419,45 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 
 		prev_freq = freq;
 	}
+
+/* ---- Add +200MHz over max entry ---- */
+{
+    unsigned int max_freq = 0;
+    unsigned int new_freq;
+    unsigned int new_volt = 0;
+    int j;
+
+    /* 既存テーブルから最大freq取得 */
+    for (j = 0; j < i; j++) {
+        if (table[j].frequency > max_freq)
+            max_freq = table[j].frequency;
+    }
+
+    if (max_freq) {
+        new_freq = max_freq + 200000; /* +200 MHz */
+
+        /*
+         * 電圧は最大エントリのものを流用
+         * 本気でやるなら +50mV くらい盛ったほうが安全
+         */
+        new_volt = volt;
+
+        if (!qcom_cpufreq_update_opp(cpu_dev, new_freq, new_volt)) {
+            table[i].frequency = new_freq;
+            table[i].flags = CPUFREQ_BOOST_FREQ;
+
+            dev_info(cpu_dev,
+                     "Added OC OPP: %u kHz (+200MHz)\n",
+                     new_freq);
+
+            i++;
+        } else {
+            dev_warn(cpu_dev,
+                     "Failed to add OC OPP %u\n",
+                     new_freq);
+        }
+    }
+}
 
 	table[i].frequency = CPUFREQ_TABLE_END;
 	policy->freq_table = table;
