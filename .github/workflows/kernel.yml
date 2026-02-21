@@ -178,6 +178,8 @@ jobs:
           cp ${OUT_DIR}/drivers/thermal/qcom/qcom_tsens.ko artifacts/ || true
           cp ${OUT_DIR}/drivers/cpufreq/qcom-cpufreq-hw.ko artifacts/ || true
           cp ${OUT_DIR}/drivers/clk/qcom/clk-qcom.ko artifacts/ || true
+          cp ${OUT_DIR}/drivers/soc/qcom/dcvs/qcom-dcvs.ko artifacts/ || true
+        
 
 
 
