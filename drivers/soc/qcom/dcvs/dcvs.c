@@ -338,9 +338,8 @@ static u32 get_target_freq(struct dcvs_path *path, u32 freq)
 					      DCVS_POWER_SCALE);
 
 			if (capped_freq < freq) {
-				trace_dcvs("PowerCap: freq %u -> %u (mW cap %u)\n",
-					   freq, capped_freq,
-					   dcvs_max_power_mw);
+				pr_debug("dcvs powercap: %u -> %u (cap=%u mW)\n",
+         freq, capped_freq, dcvs_max_power_mw);
 				freq = capped_freq;
 			}
 		}
