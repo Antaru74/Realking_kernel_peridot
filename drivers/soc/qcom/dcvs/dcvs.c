@@ -61,6 +61,13 @@ struct qcom_dcvs_data {
 };
 static struct qcom_dcvs_data	*dcvs_data;
 
+
+static u32 dcvs_max_power_mw = 0; /* 0 = unlimited */
+static DEFINE_MUTEX(dcvs_power_lock);
+
+
+#define DCVS_POWER_SCALE 1000
+
 static u32 get_target_freq(struct dcvs_path *path, u32 freq);
 
 struct qcom_dcvs_attr {
@@ -206,12 +213,45 @@ DCVS_ATTR_RW(boost_freq);
 DCVS_ATTR_RO(cur_freq);
 DCVS_ATTR_RO(available_frequencies);
 
+static ssize_t show_max_power_w(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	u32 mw;
+
+	mutex_lock(&dcvs_power_lock);
+	mw = dcvs_max_power_mw;
+	mutex_unlock(&dcvs_power_lock);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", mw / 1000);
+}
+
+static ssize_t store_max_power_w(struct kobject *kobj,
+				 struct attribute *attr,
+				 const char *buf, size_t count)
+{
+	u32 w;
+
+	if (kstrtou32(buf, 10, &w))
+		return -EINVAL;
+
+	mutex_lock(&dcvs_power_lock);
+	dcvs_max_power_mw = w * 1000;
+	mutex_unlock(&dcvs_power_lock);
+
+	pr_info("DCVS power cap set to %u mW\n", dcvs_max_power_mw);
+
+	return count;
+}
+
+DCVS_ATTR_RW(max_power_w);
+
 static struct attribute *dcvs_hw_attrs[] = {
 	&hw_min_freq.attr,
 	&hw_max_freq.attr,
 	&boost_freq.attr,
 	&cur_freq.attr,
 	&available_frequencies.attr,
+	&max_power_w.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(dcvs_hw);
@@ -285,6 +325,27 @@ static u32 get_target_freq(struct dcvs_path *path, u32 freq)
 	if (i == len)
 		target_freq = freq_table[len-1];
 
+	/* --- Power Cap Clamp (Custom) --- */
+	if (dcvs_max_power_mw > 0) {
+		u64 est_power;
+		u32 capped_freq;
+
+		
+		est_power = (u64)freq * DCVS_POWER_SCALE;
+
+		if (est_power > dcvs_max_power_mw) {
+			capped_freq = div_u64(dcvs_max_power_mw,
+					      DCVS_POWER_SCALE);
+
+			if (capped_freq < freq) {
+				trace_dcvs("PowerCap: freq %u -> %u (mW cap %u)\n",
+					   freq, capped_freq,
+					   dcvs_max_power_mw);
+				freq = capped_freq;
+			}
+		}
+	}
+	
 	return target_freq;
 }
 
