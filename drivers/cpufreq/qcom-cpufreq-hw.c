@@ -105,6 +105,90 @@ static ssize_t show_hw_clk_domain(struct cpufreq_policy *policy, char *buf)
 
 cpufreq_freq_attr_ro(hw_clk_domain);
 
+/*
+ * show_voltage_lut - 現在の周波数ごとの電圧をuV単位で取得
+ */
+static ssize_t show_voltage_lut(struct cpufreq_policy *policy, char *buf)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
+	u32 lut_data, volt_uv;
+	int i, ret = 0;
+
+	if (!data || !soc_data || !policy->freq_table)
+		return -ENODEV;
+
+	for (i = 0; i < soc_data->lut_max_entries; i++) {
+		if (policy->freq_table[i].frequency == CPUFREQ_TABLE_END)
+			break;
+
+		// ハードウェアレジスタから値を読み出し
+		lut_data = readl_relaxed(data->base + soc_data->reg_volt_lut +
+					 i * soc_data->lut_row_size);
+		
+		// ハードウェアのmVを抽出してuVに自動計算
+		volt_uv = FIELD_GET(LUT_VOLT, lut_data) * 1000;
+
+		ret += scnprintf(buf + ret, PAGE_SIZE - ret, "[%d] %u kHz : %u uV\n",
+				 i, policy->freq_table[i].frequency, volt_uv);
+	}
+
+	return ret;
+}
+
+/*
+ * store_voltage_lut - インデックスを指定して電圧をuV単位で書き換え
+ */
+static ssize_t store_voltage_lut(struct cpufreq_policy *policy,
+				 const char *buf, size_t count)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
+	u32 lut_data, volt_mv;
+	unsigned int index, volt_uv;
+	int ret;
+
+	if (!data || !soc_data)
+		return -ENODEV;
+
+	// "<index> <voltage_uv>" の形式でユーザー入力をパース
+	ret = sscanf(buf, "%u %u", &index, &volt_uv);
+	if (ret != 2)
+		return -EINVAL;
+
+	// インデックスが有効範囲内かチェック
+	if (index >= soc_data->lut_max_entries ||
+	    policy->freq_table[index].frequency == CPUFREQ_TABLE_END)
+		return -EINVAL;
+
+	// 入力されたuVをハードウェア用のmVに自動計算
+	volt_mv = volt_uv / 1000;
+
+	// LUT_VOLT は12ビット (最大4095mV) なので上限をチェック
+	if (volt_mv > 4095)
+		return -EINVAL;
+
+	// 対象インデックスのレジスタを読み込み
+	lut_data = readl_relaxed(data->base + soc_data->reg_volt_lut +
+				 index * soc_data->lut_row_size);
+	
+	// 電圧部分のビットをクリアし、新しいmV値をセット
+	lut_data &= ~LUT_VOLT;
+	lut_data |= FIELD_PREP(LUT_VOLT, volt_mv);
+
+	// ハードウェアレジスタに直接書き込んで適用
+	writel_relaxed(lut_data, data->base + soc_data->reg_volt_lut +
+				 index * soc_data->lut_row_size);
+
+	// 注意: ここでOPPテーブル自体は更新していませんが、ハードウェアDCVSは
+	// レジスタのLUTを直接参照して動くため、即座に低電圧化が反映されます。
+
+	return count;
+}
+
+// 読み書き可能なsysfs属性として定義
+cpufreq_freq_attr_rw(voltage_lut);
+
 static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 			       unsigned long freq_khz)
 {
@@ -296,7 +380,7 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 	struct qcom_cpufreq_data *drv_data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = drv_data->soc_data;
 
-	table = kcalloc(soc_data->lut_max_entries + 2, sizeof(*table), GFP_KERNEL);
+	table = kcalloc(soc_data->lut_max_entries + 1, sizeof(*table), GFP_KERNEL);
 	if (!table)
 		return -ENOMEM;
 
@@ -331,47 +415,9 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		if (i == 0)
 			max_cc = core_count;
 
-		u32 data_cur, data_adj;
-		u32 volt_cur, volt_adj;
-		u32 volt_idx = i;
-
-/* 現在の電圧を取得 */
-		data_cur = readl_relaxed(drv_data->base +
-					 soc_data->reg_volt_lut +
-					 i * soc_data->lut_row_size);
-		volt_cur = FIELD_GET(LUT_VOLT, data_cur);
-
-/* 1段目チェック */
-		if (i > 0) {
-			data_adj = readl_relaxed(drv_data->base +
-						 soc_data->reg_volt_lut +
-						 (i - 1) * soc_data->lut_row_size);
-			volt_adj = FIELD_GET(LUT_VOLT, data_adj);
-
-			if (volt_adj < volt_cur) {
-				volt_idx = i - 1;
-				volt_cur = volt_adj;
-
-		/* 2段目チェック */
-				if (i > 1) {
-					data_adj = readl_relaxed(drv_data->base +
-								 soc_data->reg_volt_lut +
-								 (i - 2) * soc_data->lut_row_size);
-					volt_adj = FIELD_GET(LUT_VOLT, data_adj);
-
-					if (volt_adj < volt_cur)
-						volt_idx = i - 2;
-				}
-			}
-		}
-
-/* 最終決定 */
-		data = readl_relaxed(drv_data->base +
-				     soc_data->reg_volt_lut +
-				     volt_idx * soc_data->lut_row_size);
+		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
+				      i * soc_data->lut_row_size);
 		volt = FIELD_GET(LUT_VOLT, data) * 1000;
-
-
 
 		if (src)
 			freq = xo_rate * lval / 1000;
@@ -419,45 +465,6 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 
 		prev_freq = freq;
 	}
-
-/* ---- Add +200MHz over max entry ---- */
-{
-    unsigned int max_freq = 0;
-    unsigned int new_freq;
-    unsigned int new_volt = 0;
-    int j;
-
-    /* 既存テーブルから最大freq取得 */
-    for (j = 0; j < i; j++) {
-        if (table[j].frequency > max_freq)
-            max_freq = table[j].frequency;
-    }
-
-    if (max_freq) {
-        new_freq = max_freq + 200000; /* +200 MHz */
-
-        /*
-         * 電圧は最大エントリのものを流用
-         * 本気でやるなら +50mV くらい盛ったほうが安全
-         */
-        new_volt = volt;
-
-        if (!qcom_cpufreq_update_opp(cpu_dev, new_freq, new_volt)) {
-            table[i].frequency = new_freq;
-            table[i].flags = CPUFREQ_BOOST_FREQ;
-
-            dev_info(cpu_dev,
-                     "Added OC OPP: %u kHz (+200MHz)\n",
-                     new_freq);
-
-            i++;
-        } else {
-            dev_warn(cpu_dev,
-                     "Failed to add OC OPP %u\n",
-                     new_freq);
-        }
-    }
-}
 
 	table[i].frequency = CPUFREQ_TABLE_END;
 	policy->freq_table = table;
@@ -941,6 +948,7 @@ static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
 static struct freq_attr *qcom_cpufreq_hw_attr[] = {
 	&cpufreq_freq_attr_scaling_available_freqs,
 	&cpufreq_freq_attr_scaling_boost_freqs,
+	&voltage_lut,
 	NULL
 };
 
