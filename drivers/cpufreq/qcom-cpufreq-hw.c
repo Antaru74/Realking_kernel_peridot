@@ -197,6 +197,12 @@ cpufreq_freq_attr_rw(voltage_lut);
 static int get_hacked_index(u32 *v_table, int i)
 {
 	if (i == 0) return 0; /* 0番目は無視 */
+	
+	if (i >= 3) {
+		u32 diff = v_table[i] - v_table[i - 3];
+		if (v_table[i] > v_table[i - 3] && diff < UV_THRESHOLD_UV)
+			return i - 3;
+	}
 
 	/* ルール1: 2つ下の電圧値をチェック */
 	if (i >= 2) {
