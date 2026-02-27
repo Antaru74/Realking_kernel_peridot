@@ -198,6 +198,18 @@ static int get_hacked_index(u32 *v_table, int i)
 {
 	if (i == 0) return 0; /* 0番目は無視 */
 	
+	if (i >= 5) {
+		u32 diff = v_table[i] - v_table[i - 5];
+		if (v_table[i] > v_table[i - 5] && diff < UV_THRESHOLD_UV)
+			return i - 5;
+	}
+	
+	if (i >= 4) {
+		u32 diff = v_table[i] - v_table[i - 4];
+		if (v_table[i] > v_table[i - 4] && diff < UV_THRESHOLD_UV)
+			return i - 4;
+	}
+	
 	if (i >= 3) {
 		u32 diff = v_table[i] - v_table[i - 3];
 		if (v_table[i] > v_table[i - 3] && diff < UV_THRESHOLD_UV)
