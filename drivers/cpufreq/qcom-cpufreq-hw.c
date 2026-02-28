@@ -34,7 +34,7 @@
 
 #define GT_IRQ_STATUS			BIT(2)
 
-#define UV_THRESHOLD_UV 50000
+#define UV_THRESHOLD_UV 80000
 
 #define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
 				(acc_count ? ((core_id + 1) * 4) : 0)
