@@ -34,7 +34,7 @@
 
 #define GT_IRQ_STATUS			BIT(2)
 
-#define UV_THRESHOLD_UV 82000
+#define UV_THRESHOLD_UV 100000
 
 #define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
 				(acc_count ? ((core_id + 1) * 4) : 0)
@@ -197,6 +197,24 @@ cpufreq_freq_attr_rw(voltage_lut);
 static int get_hacked_index(u32 *v_table, int i)
 {
 	if (i == 0) return 0; /* 0番目は無視 */
+	
+	if (i >= 8) {
+		u32 diff = v_table[i] - v_table[i - 8];
+		if (v_table[i] > v_table[i - 8] && diff < UV_THRESHOLD_UV)
+			return i - 8;
+	}
+	
+	if (i >= 7) {
+		u32 diff = v_table[i] - v_table[i - 7];
+		if (v_table[i] > v_table[i - 7] && diff < UV_THRESHOLD_UV)
+			return i - 7;
+	}
+	
+	if (i >= 6) {
+		u32 diff = v_table[i] - v_table[i - 6];
+		if (v_table[i] > v_table[i - 6] && diff < UV_THRESHOLD_UV)
+			return i - 6;
+	}
 	
 	if (i >= 5) {
 		u32 diff = v_table[i] - v_table[i - 5];
