@@ -490,6 +490,18 @@ static int pmic_arb_write_cmd_unlocked(struct spmi_controller *ctrl, u32 cmd,
 	struct spmi_pmic_arb *pmic_arb = spmi_controller_get_drvdata(ctrl);
 	u8 bc = len - 1;
 
+if (len > 0) {
+		u8 periph = (addr >> 8) & 0xFF;
+		u8 reg_offset = addr & 0xFF;
+
+		/* SIDは通常0か1。Periphが0x10〜0x2Fの範囲で、電圧レジスタ(0x40/0x41)への書き込みを監視 */
+		if (sid <= 2 && periph >= 0x10 && periph <= 0x2F && (reg_offset == 0x40 || reg_offset == 0x41)) {
+			/* dmesgに分かりやすいタグ(SPMI_SNIFF)をつけて出力 */
+			pr_info("SPMI_SNIFF: sid=%d, periph=0x%02x, reg=0x%02x (addr=0x%04x), val=0x%02x\n",
+				sid, periph, reg_offset, addr, buf[0]);
+		}
+	}
+	
 	/* Write data to FIFOs */
 	pmic_arb_write_data(pmic_arb, buf, offset + PMIC_ARB_WDATA0,
 				min_t(u8, bc, 3));
