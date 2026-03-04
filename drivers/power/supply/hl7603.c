@@ -481,6 +481,7 @@ static int hl7603_parse_dt(struct boost_bypass_dev *bq)
 static int hl7603_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
+	msleep(2000); 
 	int ret;
 	struct boost_bypass_dev *bq;
 
