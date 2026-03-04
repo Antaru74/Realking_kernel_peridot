@@ -69,6 +69,30 @@ static int hl7603_update_bits(struct boost_bypass_dev *bq,
 }
 
 /* ------------------------------------------------------------------ */
+/* Voltage threshold (defined early; called by bypass helpers below)   */
+/* ------------------------------------------------------------------ */
+
+int hl7603_set_voltage_threshold(struct boost_bypass_dev *bq,
+				 u32 vout_threshold)
+{
+	u8 val = 0;
+	int ret;
+
+	if ((vout_threshold > VOUT_REG_MAX) ||
+	    vout_threshold < VOUT_REG_BASE)
+		return -EINVAL;
+
+	val = (vout_threshold - VOUT_REG_BASE) / VOUT_REG_STEP;
+
+	ret = hl7603_write_reg(bq, VOUT_REG, val);
+	if (ret < 0)
+		return ret;
+
+	hl7603_read_reg(bq, VOUT_REG, &val);	/* readback */
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Bypass mode control                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -440,7 +464,7 @@ static const struct attribute_group hl7603_attr_group = {
 };
 
 /* ------------------------------------------------------------------ */
-/* DT parsing and voltage threshold (extended from original)            */
+/* probe / remove / power management                                    */
 /* ------------------------------------------------------------------ */
 
 static int hl7603_parse_dt(struct boost_bypass_dev *bq)
@@ -453,30 +477,6 @@ static int hl7603_parse_dt(struct boost_bypass_dev *bq)
 	of_property_read_u32(np, "vout_threshold", &bq->vout_threshold);
 	return 0;
 }
-
-int hl7603_set_voltage_threshold(struct boost_bypass_dev *bq,
-				 u32 vout_threshold)
-{
-	u8 val = 0;
-	int ret;
-
-	if ((vout_threshold > VOUT_REG_MAX) ||
-	    vout_threshold < VOUT_REG_BASE)
-		return -EINVAL;
-
-	val = (vout_threshold - VOUT_REG_BASE) / VOUT_REG_STEP;
-
-	ret = hl7603_write_reg(bq, VOUT_REG, val);
-	if (ret < 0)
-		return ret;
-
-	hl7603_read_reg(bq, VOUT_REG, &val);	/* readback */
-	return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* probe / remove / power management                                    */
-/* ------------------------------------------------------------------ */
 
 static int hl7603_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
