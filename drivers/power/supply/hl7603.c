@@ -281,20 +281,43 @@ static void hl7603_bypass_check_work(struct work_struct *work)
 
 	usb_online = hl7603_get_usb_online(bq);
 
-	/* If charger is disconnected, exit bypass immediately */
+	/* 充電器未接続：bypassを解除して終了 */
 	if (!usb_online) {
 		if (bq->bypass_mode_enabled) {
 			dev_info(bq->dev, "charger removed, exiting bypass\n");
 			hl7603_set_bypass_mode(bq, false);
 		}
+		bq->initialized = false;
 		mutex_unlock(&bq->lock);
 		schedule_delayed_work(&bq->bypass_check_work,
 				      msecs_to_jiffies(BYPASS_CHECK_INTERVAL_MS));
 		return;
 	}
 
-	/* Charger is connected: update VOUT to match adapter voltage */
-	hl7603_update_vout_for_adapter(bq);
+	/*
+	 * 充電器接続中：未初期化なら今ここでVOUT設定を行う
+	 * （probeでは充電器がない可能性があるためI2C書き込みを遅延させた）
+	 */
+	if (!bq->initialized) {
+		int ret;
+
+		hl7603_update_vout_for_adapter(bq);
+		ret = hl7603_set_voltage_threshold(bq, bq->vout_threshold);
+		if (ret) {
+			dev_err(bq->dev,
+				"I2C init failed: %d, will retry\n", ret);
+			mutex_unlock(&bq->lock);
+			schedule_delayed_work(&bq->bypass_check_work,
+					      msecs_to_jiffies(BYPASS_CHECK_INTERVAL_MS));
+			return;
+		}
+		bq->initialized = true;
+		dev_info(bq->dev, "I2C initialized (vout_thr=%u mV)\n",
+			 bq->vout_threshold);
+	} else {
+		/* 初期化済み：アダプター電圧変化に追従 */
+		hl7603_update_vout_for_adapter(bq);
+	}
 
 	soc    = hl7603_get_battery_capacity(bq);
 	status = hl7603_get_charge_status(bq);
@@ -475,13 +498,18 @@ static int hl7603_parse_dt(struct boost_bypass_dev *bq)
 		return -1;
 
 	of_property_read_u32(np, "vout_threshold", &bq->vout_threshold);
+
+	/* DTにvout_thresholdがなければデフォルト5000mV */
+	if (bq->vout_threshold < VOUT_REG_BASE ||
+	    bq->vout_threshold > VOUT_REG_MAX)
+		bq->vout_threshold = 5000;
+
 	return 0;
 }
 
 static int hl7603_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
-	msleep(2000); 
 	int ret;
 	struct boost_bypass_dev *bq;
 
@@ -494,22 +522,17 @@ static int hl7603_probe(struct i2c_client *client,
 	mutex_init(&bq->lock);
 	i2c_set_clientdata(client, bq);
 
-	ret = hl7603_parse_dt(bq);
-	if (ret) {
-		dev_err(bq->dev, "DT parse failed: %d\n", ret);
-		return ret;
-	}
+	/*
+	 * DTパース（I2C通信なし）
+	 * vout_thresholdがなければデフォルト5000mVを使用
+	 */
+	hl7603_parse_dt(bq);
 
-	ret = hl7603_set_voltage_threshold(bq, bq->vout_threshold);
-	if (ret) {
-		dev_err(bq->dev, "vout threshold init failed: %d\n", ret);
-		return ret;
-	}
-
-	/* Start in auto mode; worker will switch to bypass when appropriate */
-	mutex_lock(&bq->lock);
-	hl7603_set_bypass_mode(bq, false);
-	mutex_unlock(&bq->lock);
+	/*
+	 * probeではI2C書き込みを一切行わない。
+	 * HL7603はVINがない状態（充電器未接続時など）は
+	 * I2C通信ができないため、実際の初期化はワーカーで行う。
+	 */
 
 	/* sysfs */
 	ret = sysfs_create_group(&client->dev.kobj, &hl7603_attr_group);
@@ -522,7 +545,7 @@ static int hl7603_probe(struct i2c_client *client,
 	if (ret)
 		dev_warn(bq->dev, "psy notifier register failed: %d\n", ret);
 
-	/* Periodic bypass monitor */
+	/* 初期化ワーカー：充電器接続後に実際のI2C設定を行う */
 	INIT_DELAYED_WORK(&bq->bypass_check_work, hl7603_bypass_check_work);
 	schedule_delayed_work(&bq->bypass_check_work,
 			      msecs_to_jiffies(BYPASS_CHECK_INTERVAL_MS));
