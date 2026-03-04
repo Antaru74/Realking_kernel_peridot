@@ -74,6 +74,7 @@ struct boost_bypass_dev {
     struct i2c_client       *client;
     u32                     vout_threshold;
     bool                    bypass_mode_enabled;
+    bool                    initialized;        /* I2C初期化完了フラグ */
     struct mutex            lock;
     struct power_supply     *batt_psy;
     struct notifier_block   psy_nb;
