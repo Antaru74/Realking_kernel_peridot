@@ -141,6 +141,95 @@ static int hl7603_get_charge_status(struct boost_bypass_dev *bq)
 	return ret ? POWER_SUPPLY_STATUS_UNKNOWN : pval.intval;
 }
 
+/*
+ * hl7603_get_usb_online - returns true if USB charger is connected
+ *
+ * Reads POWER_SUPPLY_PROP_ONLINE from the "usb" power supply.
+ * This is the authoritative signal for charger plug/unplug.
+ */
+static bool hl7603_get_usb_online(struct boost_bypass_dev *bq)
+{
+	union power_supply_propval pval = {0};
+	struct power_supply *usb_psy;
+	int ret;
+
+	usb_psy = power_supply_get_by_name("usb");
+	if (!usb_psy)
+		return false;
+
+	ret = power_supply_get_property(usb_psy,
+					POWER_SUPPLY_PROP_ONLINE, &pval);
+	power_supply_put(usb_psy);
+	return ret ? false : !!pval.intval;
+}
+
+/*
+ * hl7603_get_usb_voltage_uv - returns USB input voltage in uV
+ *
+ * Used to automatically set VOUT threshold to match the adapter voltage.
+ * Returns 0 on error.
+ */
+static int hl7603_get_usb_voltage_uv(struct boost_bypass_dev *bq)
+{
+	union power_supply_propval pval = {0};
+	struct power_supply *usb_psy;
+	int ret;
+
+	usb_psy = power_supply_get_by_name("usb");
+	if (!usb_psy)
+		return 0;
+
+	ret = power_supply_get_property(usb_psy,
+					POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
+	power_supply_put(usb_psy);
+	return ret ? 0 : pval.intval;
+}
+
+/*
+ * hl7603_update_vout_for_adapter - set VOUT threshold to match adapter
+ *
+ * Snaps the measured USB voltage to the nearest standard PD/QC level
+ * (5 V / 9 V / 12 V / 20 V) and programmes VOUT_REG accordingly.
+ * A small headroom (VOUT_HEADROOM_MV) is subtracted so the bypass
+ * switch closes cleanly before the IC tries to boost.
+ *
+ * Called whenever the charger is (re-)connected or the voltage changes.
+ */
+#define VOUT_HEADROOM_MV	100	/* subtract 100 mV as safety margin */
+
+static void hl7603_update_vout_for_adapter(struct boost_bypass_dev *bq)
+{
+	int uv = hl7603_get_usb_voltage_uv(bq);
+	u32 mv, target_mv;
+
+	if (uv <= 0)
+		return;
+
+	mv = uv / 1000;
+
+	/* Snap to nearest standard adapter voltage */
+	if (mv >= 18000)
+		target_mv = 20000;
+	else if (mv >= 10500)
+		target_mv = 12000;
+	else if (mv >= 7500)
+		target_mv = 9000;
+	else
+		target_mv = 5000;
+
+	/* Apply headroom and clamp to register range */
+	target_mv -= VOUT_HEADROOM_MV;
+	target_mv = clamp(target_mv, (u32)VOUT_REG_BASE, (u32)VOUT_REG_MAX);
+
+	if (target_mv != bq->vout_threshold) {
+		dev_info(bq->dev,
+			 "adapter %u mV -> VOUT threshold %u mV\n",
+			 mv, target_mv);
+		hl7603_set_voltage_threshold(bq, target_mv);
+		bq->vout_threshold = target_mv;
+	}
+}
+
 /* ------------------------------------------------------------------ */
 /* Bypass decision worker                                               */
 /* ------------------------------------------------------------------ */
@@ -162,9 +251,26 @@ static void hl7603_bypass_check_work(struct work_struct *work)
 		container_of(work, struct boost_bypass_dev,
 			     bypass_check_work.work);
 	int soc, status;
-	bool want_bypass;
+	bool usb_online, want_bypass;
 
 	mutex_lock(&bq->lock);
+
+	usb_online = hl7603_get_usb_online(bq);
+
+	/* If charger is disconnected, exit bypass immediately */
+	if (!usb_online) {
+		if (bq->bypass_mode_enabled) {
+			dev_info(bq->dev, "charger removed, exiting bypass\n");
+			hl7603_set_bypass_mode(bq, false);
+		}
+		mutex_unlock(&bq->lock);
+		schedule_delayed_work(&bq->bypass_check_work,
+				      msecs_to_jiffies(BYPASS_CHECK_INTERVAL_MS));
+		return;
+	}
+
+	/* Charger is connected: update VOUT to match adapter voltage */
+	hl7603_update_vout_for_adapter(bq);
 
 	soc    = hl7603_get_battery_capacity(bq);
 	status = hl7603_get_charge_status(bq);
@@ -201,10 +307,33 @@ static int hl7603_psy_notifier_call(struct notifier_block *nb,
 	if (event != PSY_EVENT_PROP_CHANGED)
 		return NOTIFY_DONE;
 
-	/* Trigger an immediate re-evaluation on battery or USB changes */
-	if (!strcmp(psy->desc->name, "battery") ||
-	    !strcmp(psy->desc->name, "usb"))
+	if (!strcmp(psy->desc->name, "usb")) {
+		/*
+		 * USB state changed (plug/unplug or voltage step).
+		 * If charger was just removed, exit bypass immediately
+		 * without waiting for the next periodic check.
+		 */
+		if (!hl7603_get_usb_online(bq)) {
+			mutex_lock(&bq->lock);
+			if (bq->bypass_mode_enabled) {
+				dev_info(bq->dev,
+					 "USB removed (notifier), exiting bypass immediately\n");
+				hl7603_set_bypass_mode(bq, false);
+			}
+			mutex_unlock(&bq->lock);
+		} else {
+			/* Voltage may have changed (e.g. PPS step-up); update VOUT */
+			mutex_lock(&bq->lock);
+			hl7603_update_vout_for_adapter(bq);
+			mutex_unlock(&bq->lock);
+		}
+		/* Also kick the worker for a full re-evaluation */
 		mod_delayed_work(system_wq, &bq->bypass_check_work, 0);
+
+	} else if (!strcmp(psy->desc->name, "battery")) {
+		/* SOC or status change -> re-evaluate bypass */
+		mod_delayed_work(system_wq, &bq->bypass_check_work, 0);
+	}
 
 	return NOTIFY_OK;
 }
