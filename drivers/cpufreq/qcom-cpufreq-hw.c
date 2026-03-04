@@ -34,6 +34,10 @@
 
 #define GT_IRQ_STATUS			BIT(2)
 
+/*
+ * UV_THRESHOLD_UV: この値(uV)未満の電圧差であれば低インデックスの電圧を流用する
+ * 100000uV = 100mV
+ */
 #define UV_THRESHOLD_UV 100000
 
 #define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
@@ -108,7 +112,10 @@ static ssize_t show_hw_clk_domain(struct cpufreq_policy *policy, char *buf)
 cpufreq_freq_attr_ro(hw_clk_domain);
 
 /*
- * show_voltage_lut - 現在の周波数ごとの電圧をuV単位で取得
+ * show_voltage_lut - 現在の周波数ごとの電圧をuV単位で表示
+ *
+ * 各エントリについて、物理LUTの電圧と、リマップ後に実際にハードウェアへ
+ * 送られるインデックス/電圧を並べて表示する。
  */
 static ssize_t show_voltage_lut(struct cpufreq_policy *policy, char *buf)
 {
@@ -117,141 +124,82 @@ static ssize_t show_voltage_lut(struct cpufreq_policy *policy, char *buf)
 	int i, applied_idx, ret = 0;
 
 	for (i = 0; i < data->soc_data->lut_max_entries; i++) {
-		if (policy->freq_table[i].frequency == CPUFREQ_TABLE_END) break;
+		if (policy->freq_table[i].frequency == CPUFREQ_TABLE_END)
+			break;
 
-		/* 本来の物理電圧 */
-		raw_data = readl_relaxed(data->base + data->soc_data->reg_volt_lut + i * data->soc_data->lut_row_size);
+		/* 物理LUTの電圧 */
+		raw_data = readl_relaxed(data->base +
+					 data->soc_data->reg_volt_lut +
+					 i * data->soc_data->lut_row_size);
 		phys_volt = FIELD_GET(LUT_VOLT, raw_data) * 1000;
 
-		/* 実際にハードウェアに送られるインデックスと電圧 */
+		/* リマップ後インデックスと、そこが指す電圧 */
 		applied_idx = policy->freq_table[i].driver_data;
-		raw_data = readl_relaxed(data->base + data->soc_data->reg_volt_lut + applied_idx * data->soc_data->lut_row_size);
+		raw_data = readl_relaxed(data->base +
+					 data->soc_data->reg_volt_lut +
+					 applied_idx * data->soc_data->lut_row_size);
 		applied_volt = FIELD_GET(LUT_VOLT, raw_data) * 1000;
 
 		ret += scnprintf(buf + ret, PAGE_SIZE - ret,
-				 "[%d] %u kHz: Orig %u uV -> Hacked %u uV (Index %d)\n",
-				 i, policy->freq_table[i].frequency, phys_volt, applied_volt, applied_idx);
+				 "[%d] %u kHz: Orig %u uV -> Applied %u uV (hw_index %d)\n",
+				 i,
+				 policy->freq_table[i].frequency,
+				 phys_volt,
+				 applied_volt,
+				 applied_idx);
 	}
 	return ret;
 }
 
 /*
- * store_voltage_lut - インデックスを指定して電圧をuV単位で書き換え
+ * store_voltage_lut は削除。
+ *
+ * reg_volt_lut は読み取り専用のステータスレジスタであり、
+ * 直接書き込んでも電圧は変わらず、最悪フリーズを引き起こす。
+ * 低電圧化は get_hacked_index() によるインデックスリマップで行う。
  */
-static ssize_t store_voltage_lut(struct cpufreq_policy *policy,
-				 const char *buf, size_t count)
-{
-	struct qcom_cpufreq_data *data = policy->driver_data;
-	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
-	u32 lut_data, volt_mv;
-	unsigned int index, volt_uv;
-	int ret;
 
-	if (!data || !soc_data)
-		return -ENODEV;
+cpufreq_freq_attr_ro(voltage_lut);
 
-	// "<index> <voltage_uv>" の形式でユーザー入力をパース
-	ret = sscanf(buf, "%u %u", &index, &volt_uv);
-	if (ret != 2)
-		return -EINVAL;
-
-	// インデックスが有効範囲内かチェック
-	if (index >= soc_data->lut_max_entries ||
-	    policy->freq_table[index].frequency == CPUFREQ_TABLE_END)
-		return -EINVAL;
-
-	// 入力されたuVをハードウェア用のmVに自動計算
-	volt_mv = volt_uv / 1000;
-
-	// LUT_VOLT は12ビット (最大4095mV) なので上限をチェック
-	if (volt_mv > 4095)
-		return -EINVAL;
-
-	// 対象インデックスのレジスタを読み込み
-	lut_data = readl_relaxed(data->base + soc_data->reg_volt_lut +
-				 index * soc_data->lut_row_size);
-	
-	// 電圧部分のビットをクリアし、新しいmV値をセット
-	lut_data &= ~LUT_VOLT;
-	lut_data |= FIELD_PREP(LUT_VOLT, volt_mv);
-
-	// ハードウェアレジスタに直接書き込んで適用
-	writel_relaxed(lut_data, data->base + soc_data->reg_volt_lut +
-				 index * soc_data->lut_row_size);
-
-	// 注意: ここでOPPテーブル自体は更新していませんが、ハードウェアDCVSは
-	// レジスタのLUTを直接参照して動くため、即座に低電圧化が反映されます。
-
-	return count;
-}
-
-// 読み書き可能なsysfs属性として定義
-cpufreq_freq_attr_rw(voltage_lut);
-
-
-
-// --- ここに追加 ---
-/**
- * get_hacked_index - ルールに基づき、適用すべきインデックスを返す
+/*
+ * get_hacked_index - 電圧差が UV_THRESHOLD_UV 未満であれば
+ *                    より低いインデックスを返すことで低電圧化を実現する。
+ *
+ * 仕組み:
+ *   reg_perf_state に書き込むインデックスを、同じ周波数のまま
+ *   電圧の低いエントリへずらす。ハードウェアDCVSはそのインデックスで
+ *   LUTを引くため、実際に供給される電圧が下がる。
+ *
+ * @v_table: 全エントリの物理電圧配列 (uV)
+ * @i:       現在のエントリインデックス
+ *
+ * 戻り値: ハードウェアへ書き込むべきリマップ後インデックス
  */
 static int get_hacked_index(u32 *v_table, int i)
 {
-	if (i == 0) return 0; /* 0番目は無視 */
-	
-	if (i >= 8) {
-		u32 diff = v_table[i] - v_table[i - 8];
-		if (v_table[i] > v_table[i - 8] && diff < UV_THRESHOLD_UV)
-			return i - 8;
-	}
-	
-	if (i >= 7) {
-		u32 diff = v_table[i] - v_table[i - 7];
-		if (v_table[i] > v_table[i - 7] && diff < UV_THRESHOLD_UV)
-			return i - 7;
-	}
-	
-	if (i >= 6) {
-		u32 diff = v_table[i] - v_table[i - 6];
-		if (v_table[i] > v_table[i - 6] && diff < UV_THRESHOLD_UV)
-			return i - 6;
-	}
-	
-	if (i >= 5) {
-		u32 diff = v_table[i] - v_table[i - 5];
-		if (v_table[i] > v_table[i - 5] && diff < UV_THRESHOLD_UV)
-			return i - 5;
-	}
-	
-	if (i >= 4) {
-		u32 diff = v_table[i] - v_table[i - 4];
-		if (v_table[i] > v_table[i - 4] && diff < UV_THRESHOLD_UV)
-			return i - 4;
-	}
-	
-	if (i >= 3) {
-		u32 diff = v_table[i] - v_table[i - 3];
-		if (v_table[i] > v_table[i - 3] && diff < UV_THRESHOLD_UV)
-			return i - 3;
+	int offset;
+
+	/* インデックス0はそのまま */
+	if (i == 0)
+		return 0;
+
+	/*
+	 * 最大8段下まで試みる。差分が UV_THRESHOLD_UV 未満で
+	 * かつ電圧が本当に下がっている場合にのみリマップする。
+	 * 大きいオフセットから試すことで最大限低い電圧を狙う。
+	 */
+	for (offset = 8; offset >= 1; offset--) {
+		if (i >= offset) {
+			u32 diff = v_table[i] - v_table[i - offset];
+
+			if (v_table[i] > v_table[i - offset] &&
+			    diff < UV_THRESHOLD_UV)
+				return i - offset;
+		}
 	}
 
-	/* ルール1: 2つ下の電圧値をチェック */
-	if (i >= 2) {
-		u32 diff = v_table[i] - v_table[i - 2];
-		if (v_table[i] > v_table[i - 2] && diff < UV_THRESHOLD_UV)
-			return i - 2;
-	}
-
-	/* ルール2: 1つ下の電圧値をチェック */
-	if (i >= 1) {
-		u32 diff = v_table[i] - v_table[i - 1];
-		if (v_table[i] > v_table[i - 1] && diff < UV_THRESHOLD_UV)
-			return i - 1;
-	}
-
-	/* ルール3: 50mV以上の差がある、または下のインデックスがない場合はそのまま */
 	return i;
 }
-// ----------------
 
 static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 			       unsigned long freq_khz)
@@ -339,24 +287,36 @@ u64 qcom_cpufreq_get_cpu_cycle_counter(int cpu)
 }
 EXPORT_SYMBOL(qcom_cpufreq_get_cpu_cycle_counter);
 
+/*
+ * qcom_cpufreq_hw_target_index - 周波数切り替えのメインパス
+ *
+ * ★ 修正点:
+ *   policy->freq_table[index].driver_data に格納したリマップ後インデックスを
+ *   reg_perf_state へ書き込む。これにより、ハードウェアDCVSは低い電圧の
+ *   LUTエントリを参照するようになり、実際の供給電圧が下がる。
+ */
 static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 					unsigned int index)
 {
 	struct qcom_cpufreq_data *data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
 	unsigned long freq = policy->freq_table[index].frequency;
+	/* リマップ後インデックスを取得 */
+	unsigned int mapped_index = policy->freq_table[index].driver_data;
 	unsigned int i;
 
 	if (soc_data->perf_lock_support) {
 		if (data->pdmem_base)
-			writel_relaxed(index, data->pdmem_base);
+			writel_relaxed(mapped_index, data->pdmem_base);
 	}
 
-	writel_relaxed(index, data->base + soc_data->reg_perf_state);
+	/* ★ mapped_index を書き込むことで低電圧LUTエントリを使わせる */
+	writel_relaxed(mapped_index, data->base + soc_data->reg_perf_state);
 
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
-			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
+			writel_relaxed(mapped_index,
+				       data->base + soc_data->reg_perf_state + i * 4);
 
 	if (icc_scaling_enabled)
 		qcom_cpufreq_set_bw(policy, freq);
@@ -414,24 +374,45 @@ static unsigned int qcom_cpufreq_hw_get(unsigned int cpu)
 	return qcom_cpufreq_get_freq(cpu);
 }
 
+/*
+ * qcom_cpufreq_hw_fast_switch - 割り込みコンテキストからの高速周波数切り替え
+ *
+ * ★ 修正点:
+ *   target_index と同様、mapped_index を reg_perf_state へ書き込む。
+ *   fast_switch はスケジューラから直接呼ばれる高速パスのため、
+ *   ここを修正しないと governor によっては低電圧化が効かない。
+ */
 static unsigned int qcom_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
 						unsigned int target_freq)
 {
 	struct qcom_cpufreq_data *data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
-	unsigned int index;
+	unsigned int index = policy->cached_resolved_idx;
+	/* リマップ後インデックスを取得 */
+	unsigned int mapped_index = policy->freq_table[index].driver_data;
 	unsigned int i;
 
-	index = policy->cached_resolved_idx;
-	writel_relaxed(index, data->base + soc_data->reg_perf_state);
+	/* ★ mapped_index を書き込むことで低電圧LUTエントリを使わせる */
+	writel_relaxed(mapped_index, data->base + soc_data->reg_perf_state);
 
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
-			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
+			writel_relaxed(mapped_index,
+				       data->base + soc_data->reg_perf_state + i * 4);
 
 	return policy->freq_table[index].frequency;
 }
 
+/*
+ * qcom_cpufreq_hw_read_lut - 起動時にLUTを読み取り周波数テーブルを構築する
+ *
+ * ★ 修正点:
+ *   1. テーブル全エントリを table[i].driver_data = i で初期化し、
+ *      未設定エントリが誤ってインデックス0にリマップされないようにする。
+ *   2. get_hacked_index() で決定したリマップ後インデックスを driver_data に保存。
+ *      target_index / fast_switch がこの値を reg_perf_state へ書き込む。
+ *   3. reg_volt_lut への書き込みは行わない（読み取り専用レジスタのため）。
+ */
 static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 				    struct cpufreq_policy *policy)
 {
@@ -444,13 +425,21 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 	struct qcom_cpufreq_data *drv_data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = drv_data->soc_data;
 
-	/* --- 変更点: 物理電圧を保持する配列とハック用インデックスを追加 --- */
+	/* 物理電圧配列とリマップインデックス */
 	u32 phys_v[LUT_MAX_ENTRIES] = {0};
 	int hacked_idx;
 
 	table = kcalloc(soc_data->lut_max_entries + 1, sizeof(*table), GFP_KERNEL);
 	if (!table)
 		return -ENOMEM;
+
+	/*
+	 * ★ 修正点1: 全エントリを i→i のパススルーで初期化する。
+	 *    これにより、CPUFREQ_ENTRY_INVALID や未処理エントリが
+	 *    誤ってインデックス0へリマップされることを防ぐ。
+	 */
+	for (i = 0; i < soc_data->lut_max_entries; i++)
+		table[i].driver_data = i;
 
 	ret = dev_pm_opp_of_add_table(cpu_dev);
 	if (!ret) {
@@ -473,14 +462,14 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		icc_scaling_enabled = false;
 	}
 
-	/* --- 変更点 1: まず物理的な全電圧を先に把握する --- */
+	/* ★ 修正点2: まず全エントリの物理電圧を読み出してキャッシュする */
 	for (i = 0; i < soc_data->lut_max_entries; i++) {
 		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
 				     i * soc_data->lut_row_size);
-		phys_v[i] = FIELD_GET(LUT_VOLT, data) * 1000;
+		phys_v[i] = FIELD_GET(LUT_VOLT, data) * 1000; /* mV → uV */
 	}
 
-	/* --- 変更点 2: ループを回してテーブルを構築 --- */
+	/* ★ 修正点3: リマップインデックスを driver_data に格納してテーブルを構築 */
 	for (i = 0; i < soc_data->lut_max_entries; i++) {
 		data = readl_relaxed(drv_data->base + soc_data->reg_freq_lut +
 				      i * soc_data->lut_row_size);
@@ -496,24 +485,34 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		else
 			freq = cpu_hw_rate / 1000;
 
-		/* ハックしたインデックスを決定し、適用する電圧を上書き */
+		/*
+		 * リマップインデックスを決定し、そのインデックスが指す電圧を
+		 * OPPテーブルへ登録する。target_index / fast_switch が
+		 * このインデックスを reg_perf_state へ書き込むことで
+		 * ハードウェアに低い電圧を要求させる。
+		 */
 		hacked_idx = get_hacked_index(phys_v, i);
 		volt = phys_v[hacked_idx];
 
 		if (core_count == LUT_TURBO_IND && soc_data->turbo_ind_support)
 			table[i].frequency = CPUFREQ_ENTRY_INVALID;
 		else if (freq != prev_freq) {
-			/* ハック後の電圧 (volt) でOPPを更新 */
 			if (!qcom_cpufreq_update_opp(cpu_dev, freq, volt)) {
 				table[i].frequency = freq;
-				table[i].driver_data = hacked_idx; /* ここでリマップ！ */
-				
+				/* ★ リマップインデックスを保存 */
+				table[i].driver_data = hacked_idx;
+
 				if (core_count < max_cc)
 					table[i].flags = CPUFREQ_BOOST_FREQ;
-				dev_dbg(cpu_dev, "index=%d freq=%d, core_count %d, mapped_idx=%d\n", 
-					i, freq, core_count, hacked_idx);
+
+				dev_dbg(cpu_dev,
+					"index=%d freq=%d core_count=%d "
+					"orig_volt=%u uV -> mapped_idx=%d volt=%u uV\n",
+					i, freq, core_count,
+					phys_v[i], hacked_idx, volt);
 			} else {
-				dev_warn(cpu_dev, "failed to update OPP for freq=%d\n", freq);
+				dev_warn(cpu_dev,
+					 "failed to update OPP for freq=%d\n", freq);
 				table[i].frequency = CPUFREQ_ENTRY_INVALID;
 			}
 		}
@@ -533,9 +532,10 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 				if (!qcom_cpufreq_update_opp(cpu_dev, prev_freq, volt)) {
 					prev->frequency = prev_freq;
 					prev->flags = CPUFREQ_BOOST_FREQ;
-					prev->driver_data = hacked_idx; /* 念のため終端処理でもリマップ */
+					prev->driver_data = hacked_idx;
 				} else {
-					dev_warn(cpu_dev, "failed to update OPP for freq=%d\n",
+					dev_warn(cpu_dev,
+						 "failed to update OPP for freq=%d\n",
 						 freq);
 				}
 			}
@@ -801,7 +801,7 @@ static int qcom_cpufreq_hw_lmh_init(struct cpufreq_policy *policy, int index,
 				   IRQF_ONESHOT | IRQF_NO_AUTOEN, data->irq_name, data);
 	if (ret) {
 		dev_err(&pdev->dev, "Error registering %s: %d\n", data->irq_name, ret);
-		return 0;
+		return ret;
 	}
 
 	ret = irq_set_affinity_and_hint(data->throttle_irq, policy->cpus);
