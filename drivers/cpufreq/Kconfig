@@ -226,6 +226,50 @@ config CPU_FREQ_GOV_SCHEDUTIL
 	  frequency tipping point is at utilization/capacity equal to 80% in
 	  both cases.
 
+	  Source: kernel/sched/cpufreq_schedutil.c
+	  Adds sysfs tunable: util_scale_pct (1-100, default 100).
+
+	  If in doubt, say N.
+
+config CPU_FREQ_GOV_WALT
+	bool "'walt' cpufreq policy governor"
+	depends on CPU_FREQ && SMP && SCHED_WALT
+	select CPU_FREQ_GOV_ATTR_SET
+	select IRQ_WORK
+	help
+	  WALT (Window Assisted Load Tracking) based cpufreq governor
+	  for Qualcomm Snapdragon SoCs. Provides better performance/power
+	  balance than schedutil on these platforms by using WALT scheduler
+	  load tracking.
+
+	  Source: kernel/sched/walt/cpufreq_walt.c
+	  Adds sysfs tunable: util_scale_pct (1-100, default 100).
+
+	  If in doubt, say N.
+
+config CPU_FREQ_UTIL_SCALE
+	tristate "CPU freq util scale hook (schedutil / walt / UAG)"
+	depends on CPU_FREQ && SMP
+	help
+	  Registers an android_vh_map_util_freq vendor hook that scales
+	  the CPU utilisation seen by ALL cpufreq governors — including
+	  the closed-source UAG governor (cpufreq_uag.ko) — before the
+	  frequency is calculated.
+
+	  Exposes one sysfs knob:
+	    /sys/kernel/cpufreq_util_scale/util_scale_pct   (1-100)
+
+	  Setting a value below 100 causes governors to request a lower
+	  frequency than they otherwise would, which in turn causes CPR
+	  to select a lower supply voltage.  The net effect is reduced
+	  power consumption with a minor performance impact proportional
+	  to (100 - util_scale_pct).
+
+	  Use this instead of (or in addition to) the per-governor
+	  util_scale_pct sysfs nodes when the active governor is UAG.
+
+	  To compile as a built-in, say Y.
+	  To compile as a loadable module, say M (cpufreq_util_scale.ko).
 	  If in doubt, say N.
 
 comment "CPU frequency scaling drivers"
