@@ -130,6 +130,15 @@ config CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
 	  have a look at the help section of that governor. The fallback
 	  governor will be 'performance'.
 
+config CPU_FREQ_DEFAULT_GOV_UAG
+	bool "uag"
+	depends on SMP
+	select CPU_FREQ_GOV_UAG
+	select CPU_FREQ_GOV_PERFORMANCE
+	help
+	  Use the UAG (Util-Aware Governor) by default.
+	  Recommended for Qualcomm Snapdragon devices.
+
 endchoice
 
 config CPU_FREQ_GOV_PERFORMANCE
@@ -246,6 +255,38 @@ config CPU_FREQ_GOV_WALT
 	  Adds sysfs tunable: util_scale_pct (1-100, default 100).
 
 	  If in doubt, say N.
+
+config CPU_FREQ_GOV_UAG
+	tristate "'uag' cpufreq policy governor"
+	depends on CPU_FREQ && SMP
+	select CPU_FREQ_GOV_ATTR_SET
+	select IRQ_WORK
+	help
+	  UAG (Util-Aware Governor) - Reverse-engineered implementation
+	  based on OPlus/Qualcomm cpufreq_uag.ko for Snapdragon devices.
+
+	  Features:
+	    - target_loads / multi_target_loads: per-cluster load tables
+	    - hispeed_freq / hispeed_load: boost frequency point
+	    - up_rate_limit_us / down_rate_limit_us: rate limiting
+	    - soft_limit_freq: soft frequency ceiling
+	    - stall_aware: AMU counter based stall detection
+	    - util_scale_pct: scale util for power reduction (1-100)
+
+	  Proc entries: /proc/uag/
+
+	  To compile as a module, choose M here: cpufreq_uag.ko
+	  If in doubt, say N.
+
+	  Source: drivers/cpufreq/cpufreq_uag.c
+
+config CPU_FREQ_DEFAULT_GOV_UAG
+	bool "uag"
+	depends on SMP
+	select CPU_FREQ_GOV_UAG
+	select CPU_FREQ_GOV_PERFORMANCE
+	help
+	  Use the UAG cpufreq governor by default.
 
 config CPU_FREQ_UTIL_SCALE
 	tristate "CPU freq util scale hook (schedutil / walt / UAG)"
