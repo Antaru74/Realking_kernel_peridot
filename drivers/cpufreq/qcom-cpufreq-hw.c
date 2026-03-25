@@ -22,9 +22,11 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/dcvsh.h>
 #include <linux/units.h>
-#include <linux/hrtimer.h>
 #include <linux/power_supply.h>
 #include <linux/atomic.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
 
 #define LUT_MAX_ENTRIES			40U
 #define LUT_SRC				GENMASK(31, 30)
@@ -88,54 +90,43 @@ struct qcom_cpufreq_data {
 	unsigned long dcvsh_freq_limit;
 	struct device_attribute freq_limit_attr;
 
-	/* power limiter: U32_MAX=no cap, otherwise max LUT index */
+	/* power limiter: U32_MAX = no cap, else max LUT index */
 	u32 power_cap_index;
 };
 
-/* ═══════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════
  * Power Limiter
  *
- * Usage (after insmod / boot):
- *   echo 1     > /sys/kernel/power_limiter/enabled
- *   echo 5000  > /sys/kernel/power_limiter/target_mw
- *   cat         /sys/kernel/power_limiter/actual_mw
+ * Uses a kthread (process context) so power_supply_get_by_name
+ * and other sleeping functions are safe to call.
  *
- * Mechanism:
- *   hrtimer fires every 20 ms.
- *   Reads battery current_now * voltage_now -> actual mW.
- *   If actual > target + TOL_OVER: step every cluster's LUT
- *     index up by 1 (= lower freq) and write reg_perf_state
- *     directly so the change takes effect immediately.
- *   If actual < target - TOL_UNDER: step index back down by 1.
- *   target_index() hook prevents the governor from overriding
- *   the cap between timer firings.
- * ═══════════════════════════════════════════════════════════ */
+ * /sys/kernel/power_limiter/enabled    0/1
+ * /sys/kernel/power_limiter/target_mw  target in mW
+ * /sys/kernel/power_limiter/actual_mw  measured mW (read-only)
+ * ═══════════════════════════════════════════════════════ */
 #define PL_MAX_POLICIES   8
-#define PL_POLL_NS        (20 * NSEC_PER_MSEC)
-#define PL_TOL_OVER_MW    150
-#define PL_TOL_UNDER_MW   300
-#define PL_SETTLE_LOOPS   3     /* skip N polls after a change */
+#define PL_POLL_MS        20    /* polling interval */
+#define PL_TOL_OVER_MW    150   /* step down if over target+TOL */
+#define PL_TOL_UNDER_MW   300   /* step up  if under target-TOL */
+#define PL_SETTLE_MS      80    /* wait after a freq change */
 
 struct power_limiter {
-	atomic_t        target_mw;   /* 0 = unlimited */
-	atomic_t        actual_mw;
-	atomic_t        enabled;
-	struct hrtimer  timer;
-	spinlock_t      lock;
-	struct kobject *kobj;
+	atomic_t         target_mw;
+	atomic_t         actual_mw;
+	atomic_t         enabled;
+	struct task_struct *task;
+	spinlock_t        lock;
+	struct kobject   *kobj;
 	struct cpufreq_policy *policies[PL_MAX_POLICIES];
-	int             n_policies;
-	int             settle;
+	int               n_policies;
 };
 static struct power_limiter pl;
 
-/* forward decl */
-static enum hrtimer_restart pl_timer_fn(struct hrtimer *t);
-
-/* ── sysfs: target_mw ── */
+/* ── sysfs ── */
 static ssize_t pl_target_show(struct kobject *k,
 			      struct kobj_attribute *a, char *buf)
 { return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.target_mw)); }
+
 static ssize_t pl_target_store(struct kobject *k,
 			       struct kobj_attribute *a,
 			       const char *buf, size_t n)
@@ -148,17 +139,16 @@ static ssize_t pl_target_store(struct kobject *k,
 static struct kobj_attribute pl_target_attr =
 	__ATTR(target_mw, 0644, pl_target_show, pl_target_store);
 
-/* ── sysfs: actual_mw ── */
 static ssize_t pl_actual_show(struct kobject *k,
 			      struct kobj_attribute *a, char *buf)
 { return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.actual_mw)); }
 static struct kobj_attribute pl_actual_attr =
 	__ATTR(actual_mw, 0444, pl_actual_show, NULL);
 
-/* ── sysfs: enabled ── */
 static ssize_t pl_enabled_show(struct kobject *k,
 			       struct kobj_attribute *a, char *buf)
 { return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.enabled)); }
+
 static ssize_t pl_enabled_store(struct kobject *k,
 				struct kobj_attribute *a,
 				const char *buf, size_t n)
@@ -175,7 +165,6 @@ static ssize_t pl_enabled_store(struct kobject *k,
 			d = pl.policies[i]->driver_data;
 			if (d) d->power_cap_index = U32_MAX;
 		}
-		pl.settle = 0;
 		spin_unlock_irqrestore(&pl.lock, f);
 	}
 	return n;
@@ -189,118 +178,141 @@ static struct attribute *pl_attrs[] = {
 };
 static const struct attribute_group pl_attr_grp = { .attrs = pl_attrs };
 
-/* ── hrtimer callback ── */
-static enum hrtimer_restart pl_timer_fn(struct hrtimer *t)
+/* ── kthread body ──────────────────────────────────────
+ * Runs in process context: sleeping functions are safe.
+ */
+static int pl_thread_fn(void *data)
 {
-	struct power_supply *psy;
-	union power_supply_propval pv;
-	long cur_ua = 0, volt_uv = 0, mw_now, target, diff;
-	unsigned long f;
-	int i;
+	while (!kthread_should_stop()) {
+		struct power_supply *psy;
+		union power_supply_propval pv;
+		long cur_ua = 0, volt_uv = 0, mw_now, target, diff;
+		unsigned long f;
+		int i;
+		bool settling = false;
 
-	hrtimer_forward_now(t, ns_to_ktime(PL_POLL_NS));
-
-	if (!atomic_read(&pl.enabled))
-		return HRTIMER_RESTART;
-
-	/* find battery psy */
-	psy = power_supply_get_by_name("battery");
-	if (!psy) psy = power_supply_get_by_name("Battery");
-	if (!psy) return HRTIMER_RESTART;
-
-	/* skip while charging */
-	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &pv)
-	    && pv.intval == POWER_SUPPLY_STATUS_CHARGING) {
-		power_supply_put(psy);
-		spin_lock_irqsave(&pl.lock, f);
-		for (i = 0; i < pl.n_policies; i++) {
-			struct qcom_cpufreq_data *d;
-			if (!pl.policies[i]) continue;
-			d = pl.policies[i]->driver_data;
-			if (d) d->power_cap_index = U32_MAX;
+		if (!atomic_read(&pl.enabled)) {
+			msleep(PL_POLL_MS);
+			continue;
 		}
-		pl.settle = 0;
-		spin_unlock_irqrestore(&pl.lock, f);
-		return HRTIMER_RESTART;
-	}
 
-	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
-		cur_ua = abs(pv.intval);
-	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
-		volt_uv = pv.intval;
-	power_supply_put(psy);
+		/* find battery psy - safe here (process context) */
+		psy = power_supply_get_by_name("battery");
+		if (!psy) psy = power_supply_get_by_name("Battery");
+		if (!psy) { msleep(PL_POLL_MS); continue; }
 
-	if (!cur_ua || !volt_uv) return HRTIMER_RESTART;
-
-	/* mW = (uA/1000) * (uV/1000) / 1000 */
-	mw_now = (cur_ua / 1000LL) * (volt_uv / 1000LL) / 1000LL;
-	atomic_set(&pl.actual_mw, (int)mw_now);
-
-	target = (long)atomic_read(&pl.target_mw);
-	if (target <= 0) return HRTIMER_RESTART;
-
-	diff = mw_now - target;
-
-	spin_lock_irqsave(&pl.lock, f);
-
-	if (pl.settle > 0) { pl.settle--; goto out; }
-
-	if (diff > (long)PL_TOL_OVER_MW) {
-		/*
-		 * Over limit: increment LUT index on every policy
-		 * (higher index = lower frequency on EPSS LUT).
-		 * Also write reg_perf_state directly so the change
-		 * takes effect before the next governor tick.
-		 */
-		for (i = 0; i < pl.n_policies; i++) {
-			struct qcom_cpufreq_data *d;
-			const struct qcom_cpufreq_soc_data *sd;
-			unsigned int cur_hw, new_idx, max_idx, k, ncpus;
-
-			if (!pl.policies[i]) continue;
-			d = pl.policies[i]->driver_data;
-			if (!d || !d->base) continue;
-			sd = d->soc_data;
-			max_idx = sd->lut_max_entries - 1;
-
-			/* read current hw index */
-			cur_hw = readl_relaxed(d->base + sd->reg_perf_state);
-			cur_hw = min(cur_hw, max_idx);
-
-			if (d->power_cap_index == U32_MAX)
-				d->power_cap_index = cur_hw;
-
-			new_idx = min(d->power_cap_index + 1, max_idx);
-			d->power_cap_index = new_idx;
-
-			/* immediate hw write */
-			writel_relaxed(new_idx, d->base + sd->reg_perf_state);
-			if (d->per_core_dcvs) {
-				ncpus = cpumask_weight(
-					pl.policies[i]->related_cpus);
-				for (k = 1; k < ncpus; k++)
-					writel_relaxed(new_idx,
-						d->base +
-						sd->reg_perf_state + k * 4);
+		/* skip while charging */
+		if (!power_supply_get_property(psy,
+				POWER_SUPPLY_PROP_STATUS, &pv) &&
+		    pv.intval == POWER_SUPPLY_STATUS_CHARGING) {
+			power_supply_put(psy);
+			/* lift all caps */
+			spin_lock_irqsave(&pl.lock, f);
+			for (i = 0; i < pl.n_policies; i++) {
+				struct qcom_cpufreq_data *d;
+				if (!pl.policies[i]) continue;
+				d = pl.policies[i]->driver_data;
+				if (d) d->power_cap_index = U32_MAX;
 			}
+			spin_unlock_irqrestore(&pl.lock, f);
+			msleep(PL_POLL_MS);
+			continue;
 		}
-		pl.settle = PL_SETTLE_LOOPS;
 
-	} else if (diff < -(long)PL_TOL_UNDER_MW) {
-		/* Under limit: relax cap by 1 step toward max freq */
-		for (i = 0; i < pl.n_policies; i++) {
-			struct qcom_cpufreq_data *d;
-			if (!pl.policies[i]) continue;
-			d = pl.policies[i]->driver_data;
-			if (!d || d->power_cap_index == U32_MAX) continue;
-			if (d->power_cap_index > 0)
-				d->power_cap_index--;
+		/* read current and voltage */
+		if (!power_supply_get_property(psy,
+				POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
+			cur_ua = abs(pv.intval);
+		if (!power_supply_get_property(psy,
+				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
+			volt_uv = pv.intval;
+		power_supply_put(psy);
+
+		if (!cur_ua || !volt_uv) {
+			msleep(PL_POLL_MS);
+			continue;
 		}
-		pl.settle = PL_SETTLE_LOOPS;
+
+		/* mW = (uA/1000) * (uV/1000) / 1000 */
+		mw_now = (cur_ua / 1000LL) * (volt_uv / 1000LL) / 1000LL;
+		atomic_set(&pl.actual_mw, (int)mw_now);
+
+		target = (long)atomic_read(&pl.target_mw);
+		if (target <= 0) { msleep(PL_POLL_MS); continue; }
+
+		diff = mw_now - target;
+
+		spin_lock_irqsave(&pl.lock, f);
+
+		if (diff > (long)PL_TOL_OVER_MW) {
+			/*
+			 * Over: step every cluster's LUT index up by 1
+			 * (higher index = lower freq on EPSS LUT).
+			 * Write reg_perf_state directly for immediate effect.
+			 */
+			for (i = 0; i < pl.n_policies; i++) {
+				struct qcom_cpufreq_data *d;
+				const struct qcom_cpufreq_soc_data *sd;
+				unsigned int cur_hw, new_idx, max_idx;
+				unsigned int k, ncpus;
+
+				if (!pl.policies[i]) continue;
+				d = pl.policies[i]->driver_data;
+				if (!d || !d->base) continue;
+				sd = d->soc_data;
+				max_idx = sd->lut_max_entries - 1;
+
+				cur_hw = readl_relaxed(
+					d->base + sd->reg_perf_state);
+				cur_hw = min(cur_hw, max_idx);
+
+				if (d->power_cap_index == U32_MAX)
+					d->power_cap_index = cur_hw;
+
+				new_idx = min(d->power_cap_index + 1,
+					      max_idx);
+				d->power_cap_index = new_idx;
+
+				writel_relaxed(new_idx,
+					d->base + sd->reg_perf_state);
+				if (d->per_core_dcvs) {
+					ncpus = cpumask_weight(
+						pl.policies[i]->related_cpus);
+					for (k = 1; k < ncpus; k++)
+						writel_relaxed(new_idx,
+							d->base +
+							sd->reg_perf_state
+							+ k * 4);
+				}
+			}
+			settling = true;
+
+		} else if (diff < -(long)PL_TOL_UNDER_MW) {
+			/* Under: relax cap by 1 step */
+			for (i = 0; i < pl.n_policies; i++) {
+				struct qcom_cpufreq_data *d;
+				if (!pl.policies[i]) continue;
+				d = pl.policies[i]->driver_data;
+				if (!d || d->power_cap_index == U32_MAX)
+					continue;
+				if (d->power_cap_index > 0)
+					d->power_cap_index--;
+			}
+			settling = true;
+		}
+
+		spin_unlock_irqrestore(&pl.lock, f);
+
+		/*
+		 * After a freq change, wait PL_SETTLE_MS for the sensor
+		 * to reflect the new power consumption before deciding again.
+		 */
+		if (settling)
+			msleep(PL_SETTLE_MS);
+		else
+			msleep(PL_POLL_MS);
 	}
-out:
-	spin_unlock_irqrestore(&pl.lock, f);
-	return HRTIMER_RESTART;
+	return 0;
 }
 
 static unsigned long cpu_hw_rate, xo_rate;
@@ -416,7 +428,7 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	unsigned long freq;
 	unsigned int i;
 
-	/* power limiter: clamp index to cap */
+	/* power limiter: clamp to cap index */
 	if (atomic_read(&pl.enabled) &&
 	    data->power_cap_index != U32_MAX &&
 	    index < data->power_cap_index)
@@ -1060,14 +1072,14 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	if (ret)
 		goto error;
 
-	/* power limiter init */
+	/* power limiter: init cap and register policy */
 	data->power_cap_index = U32_MAX;
 	{
-		unsigned long f; int pi, already = 0;
+		unsigned long f; int pi, found = 0;
 		spin_lock_irqsave(&pl.lock, f);
 		for (pi = 0; pi < pl.n_policies; pi++)
-			if (pl.policies[pi] == policy) { already = 1; break; }
-		if (!already && pl.n_policies < PL_MAX_POLICIES)
+			if (pl.policies[pi] == policy) { found = 1; break; }
+		if (!found && pl.n_policies < PL_MAX_POLICIES)
 			pl.policies[pl.n_policies++] = policy;
 		spin_unlock_irqrestore(&pl.lock, f);
 	}
@@ -1083,7 +1095,6 @@ static int qcom_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
 	struct device *cpu_dev = get_cpu_device(policy->cpu);
 	unsigned long f; int i;
 
-	/* unregister from power limiter */
 	spin_lock_irqsave(&pl.lock, f);
 	for (i = 0; i < pl.n_policies; i++) {
 		if (pl.policies[i] == policy) {
@@ -1176,34 +1187,34 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 	}
 	dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
 
-	/* power limiter: init state */
+	/* power limiter init */
 	atomic_set(&pl.target_mw, 0);
 	atomic_set(&pl.actual_mw, 0);
 	atomic_set(&pl.enabled,   0);
 	spin_lock_init(&pl.lock);
 	pl.n_policies = 0;
-	pl.settle     = 0;
 
-	/* sysfs: /sys/kernel/power_limiter/ */
 	pl.kobj = kobject_create_and_add("power_limiter", kernel_kobj);
 	if (pl.kobj) {
 		if (sysfs_create_group(pl.kobj, &pl_attr_grp))
 			dev_warn(&pdev->dev, "power_limiter sysfs failed\n");
-	} else {
-		dev_warn(&pdev->dev, "power_limiter kobject failed\n");
 	}
 
-	/* start hrtimer (disabled until echo 1 > enabled) */
-	hrtimer_init(&pl.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	pl.timer.function = pl_timer_fn;
-	hrtimer_start(&pl.timer, ns_to_ktime(PL_POLL_NS), HRTIMER_MODE_REL);
+	pl.task = kthread_run(pl_thread_fn, NULL, "power_limiter");
+	if (IS_ERR(pl.task)) {
+		dev_warn(&pdev->dev, "power_limiter kthread failed\n");
+		pl.task = NULL;
+	}
 
 	return 0;
 }
 
 static int qcom_cpufreq_hw_driver_remove(struct platform_device *pdev)
 {
-	hrtimer_cancel(&pl.timer);
+	if (pl.task) {
+		kthread_stop(pl.task);
+		pl.task = NULL;
+	}
 	if (pl.kobj) {
 		sysfs_remove_group(pl.kobj, &pl_attr_grp);
 		kobject_put(pl.kobj);
