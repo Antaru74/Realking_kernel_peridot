@@ -13,6 +13,9 @@
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
 	unsigned int		rate_limit_us;
+	/* util_scale_pct: 1-100. 100=no change, 85=scale util to 85%
+	 * Lower value = lower requested freq = lower voltage (UV effect) */
+	unsigned int		util_scale_pct;
 };
 
 struct sugov_policy {
@@ -370,7 +373,13 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 	if (!sugov_update_single_common(sg_cpu, time, flags))
 		return;
 
-	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
+	{
+		unsigned long _util = sg_cpu->util;
+		unsigned int _s = sg_policy->tunables->util_scale_pct;
+		if (_s > 0 && _s < 100)
+			_util = _util * _s / 100;
+		next_f = get_next_freq(sg_policy, _util, sg_cpu->max);
+	}
 	/*
 	 * Do not reduce the frequency if the CPU has not been idle
 	 * recently, as the reduction is likely to be premature then.
@@ -460,6 +469,11 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		}
 	}
 
+	{
+		unsigned int _s = sg_policy->tunables->util_scale_pct;
+		if (_s > 0 && _s < 100)
+			util = util * _s / 100;
+	}
 	return get_next_freq(sg_policy, util, max);
 }
 
@@ -564,8 +578,26 @@ rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count
 
 static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
 
+static ssize_t util_scale_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", tunables->util_scale_pct);
+}
+static ssize_t util_scale_pct_store(struct gov_attr_set *attr_set,
+				     const char *buf, size_t count)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val) || val == 0 || val > 100)
+		return -EINVAL;
+	tunables->util_scale_pct = val;
+	return count;
+}
+static struct governor_attr util_scale_pct = __ATTR_RW(util_scale_pct);
+
 static struct attribute *sugov_attrs[] = {
 	&rate_limit_us.attr,
+	&util_scale_pct.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(sugov);
@@ -730,6 +762,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	tunables->rate_limit_us = 2000;
+	tunables->util_scale_pct = 100;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
