@@ -22,6 +22,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/dcvsh.h>
 #include <linux/units.h>
+#include <linux/hrtimer.h>
+#include <linux/power_supply.h>
+#include <linux/atomic.h>
 
 #define LUT_MAX_ENTRIES			40U
 #define LUT_SRC				GENMASK(31, 30)
@@ -33,12 +36,6 @@
 #define MAX_FN_SIZE			20
 
 #define GT_IRQ_STATUS			BIT(2)
-
-/*
- * UV_THRESHOLD_UV: この値(uV)未満の電圧差であれば低インデックスの電圧を流用する
- * 100000uV = 100mV
- */
-#define UV_THRESHOLD_UV 100000
 
 #define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
 				(acc_count ? ((core_id + 1) * 4) : 0)
@@ -90,7 +87,221 @@ struct qcom_cpufreq_data {
 	bool per_core_dcvs;
 	unsigned long dcvsh_freq_limit;
 	struct device_attribute freq_limit_attr;
+
+	/* power limiter: U32_MAX=no cap, otherwise max LUT index */
+	u32 power_cap_index;
 };
+
+/* ═══════════════════════════════════════════════════════════
+ * Power Limiter
+ *
+ * Usage (after insmod / boot):
+ *   echo 1     > /sys/kernel/power_limiter/enabled
+ *   echo 5000  > /sys/kernel/power_limiter/target_mw
+ *   cat         /sys/kernel/power_limiter/actual_mw
+ *
+ * Mechanism:
+ *   hrtimer fires every 20 ms.
+ *   Reads battery current_now * voltage_now -> actual mW.
+ *   If actual > target + TOL_OVER: step every cluster's LUT
+ *     index up by 1 (= lower freq) and write reg_perf_state
+ *     directly so the change takes effect immediately.
+ *   If actual < target - TOL_UNDER: step index back down by 1.
+ *   target_index() hook prevents the governor from overriding
+ *   the cap between timer firings.
+ * ═══════════════════════════════════════════════════════════ */
+#define PL_MAX_POLICIES   8
+#define PL_POLL_NS        (20 * NSEC_PER_MSEC)
+#define PL_TOL_OVER_MW    150
+#define PL_TOL_UNDER_MW   300
+#define PL_SETTLE_LOOPS   3     /* skip N polls after a change */
+
+struct power_limiter {
+	atomic_t        target_mw;   /* 0 = unlimited */
+	atomic_t        actual_mw;
+	atomic_t        enabled;
+	struct hrtimer  timer;
+	spinlock_t      lock;
+	struct kobject *kobj;
+	struct cpufreq_policy *policies[PL_MAX_POLICIES];
+	int             n_policies;
+	int             settle;
+};
+static struct power_limiter pl;
+
+/* forward decl */
+static enum hrtimer_restart pl_timer_fn(struct hrtimer *t);
+
+/* ── sysfs: target_mw ── */
+static ssize_t pl_target_show(struct kobject *k,
+			      struct kobj_attribute *a, char *buf)
+{ return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.target_mw)); }
+static ssize_t pl_target_store(struct kobject *k,
+			       struct kobj_attribute *a,
+			       const char *buf, size_t n)
+{
+	int v;
+	if (kstrtoint(buf, 10, &v) || v < 0) return -EINVAL;
+	atomic_set(&pl.target_mw, v);
+	return n;
+}
+static struct kobj_attribute pl_target_attr =
+	__ATTR(target_mw, 0644, pl_target_show, pl_target_store);
+
+/* ── sysfs: actual_mw ── */
+static ssize_t pl_actual_show(struct kobject *k,
+			      struct kobj_attribute *a, char *buf)
+{ return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.actual_mw)); }
+static struct kobj_attribute pl_actual_attr =
+	__ATTR(actual_mw, 0444, pl_actual_show, NULL);
+
+/* ── sysfs: enabled ── */
+static ssize_t pl_enabled_show(struct kobject *k,
+			       struct kobj_attribute *a, char *buf)
+{ return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&pl.enabled)); }
+static ssize_t pl_enabled_store(struct kobject *k,
+				struct kobj_attribute *a,
+				const char *buf, size_t n)
+{
+	int v; unsigned long f; int i;
+	if (kstrtoint(buf, 10, &v)) return -EINVAL;
+	atomic_set(&pl.enabled, !!v);
+	if (!v) {
+		/* disabled: lift all caps */
+		spin_lock_irqsave(&pl.lock, f);
+		for (i = 0; i < pl.n_policies; i++) {
+			struct qcom_cpufreq_data *d;
+			if (!pl.policies[i]) continue;
+			d = pl.policies[i]->driver_data;
+			if (d) d->power_cap_index = U32_MAX;
+		}
+		pl.settle = 0;
+		spin_unlock_irqrestore(&pl.lock, f);
+	}
+	return n;
+}
+static struct kobj_attribute pl_enabled_attr =
+	__ATTR(enabled, 0644, pl_enabled_show, pl_enabled_store);
+
+static struct attribute *pl_attrs[] = {
+	&pl_target_attr.attr, &pl_actual_attr.attr,
+	&pl_enabled_attr.attr, NULL,
+};
+static const struct attribute_group pl_attr_grp = { .attrs = pl_attrs };
+
+/* ── hrtimer callback ── */
+static enum hrtimer_restart pl_timer_fn(struct hrtimer *t)
+{
+	struct power_supply *psy;
+	union power_supply_propval pv;
+	long cur_ua = 0, volt_uv = 0, mw_now, target, diff;
+	unsigned long f;
+	int i;
+
+	hrtimer_forward_now(t, ns_to_ktime(PL_POLL_NS));
+
+	if (!atomic_read(&pl.enabled))
+		return HRTIMER_RESTART;
+
+	/* find battery psy */
+	psy = power_supply_get_by_name("battery");
+	if (!psy) psy = power_supply_get_by_name("Battery");
+	if (!psy) return HRTIMER_RESTART;
+
+	/* skip while charging */
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &pv)
+	    && pv.intval == POWER_SUPPLY_STATUS_CHARGING) {
+		power_supply_put(psy);
+		spin_lock_irqsave(&pl.lock, f);
+		for (i = 0; i < pl.n_policies; i++) {
+			struct qcom_cpufreq_data *d;
+			if (!pl.policies[i]) continue;
+			d = pl.policies[i]->driver_data;
+			if (d) d->power_cap_index = U32_MAX;
+		}
+		pl.settle = 0;
+		spin_unlock_irqrestore(&pl.lock, f);
+		return HRTIMER_RESTART;
+	}
+
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &pv))
+		cur_ua = abs(pv.intval);
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &pv))
+		volt_uv = pv.intval;
+	power_supply_put(psy);
+
+	if (!cur_ua || !volt_uv) return HRTIMER_RESTART;
+
+	/* mW = (uA/1000) * (uV/1000) / 1000 */
+	mw_now = (cur_ua / 1000LL) * (volt_uv / 1000LL) / 1000LL;
+	atomic_set(&pl.actual_mw, (int)mw_now);
+
+	target = (long)atomic_read(&pl.target_mw);
+	if (target <= 0) return HRTIMER_RESTART;
+
+	diff = mw_now - target;
+
+	spin_lock_irqsave(&pl.lock, f);
+
+	if (pl.settle > 0) { pl.settle--; goto out; }
+
+	if (diff > (long)PL_TOL_OVER_MW) {
+		/*
+		 * Over limit: increment LUT index on every policy
+		 * (higher index = lower frequency on EPSS LUT).
+		 * Also write reg_perf_state directly so the change
+		 * takes effect before the next governor tick.
+		 */
+		for (i = 0; i < pl.n_policies; i++) {
+			struct qcom_cpufreq_data *d;
+			const struct qcom_cpufreq_soc_data *sd;
+			unsigned int cur_hw, new_idx, max_idx, k, ncpus;
+
+			if (!pl.policies[i]) continue;
+			d = pl.policies[i]->driver_data;
+			if (!d || !d->base) continue;
+			sd = d->soc_data;
+			max_idx = sd->lut_max_entries - 1;
+
+			/* read current hw index */
+			cur_hw = readl_relaxed(d->base + sd->reg_perf_state);
+			cur_hw = min(cur_hw, max_idx);
+
+			if (d->power_cap_index == U32_MAX)
+				d->power_cap_index = cur_hw;
+
+			new_idx = min(d->power_cap_index + 1, max_idx);
+			d->power_cap_index = new_idx;
+
+			/* immediate hw write */
+			writel_relaxed(new_idx, d->base + sd->reg_perf_state);
+			if (d->per_core_dcvs) {
+				ncpus = cpumask_weight(
+					pl.policies[i]->related_cpus);
+				for (k = 1; k < ncpus; k++)
+					writel_relaxed(new_idx,
+						d->base +
+						sd->reg_perf_state + k * 4);
+			}
+		}
+		pl.settle = PL_SETTLE_LOOPS;
+
+	} else if (diff < -(long)PL_TOL_UNDER_MW) {
+		/* Under limit: relax cap by 1 step toward max freq */
+		for (i = 0; i < pl.n_policies; i++) {
+			struct qcom_cpufreq_data *d;
+			if (!pl.policies[i]) continue;
+			d = pl.policies[i]->driver_data;
+			if (!d || d->power_cap_index == U32_MAX) continue;
+			if (d->power_cap_index > 0)
+				d->power_cap_index--;
+		}
+		pl.settle = PL_SETTLE_LOOPS;
+	}
+out:
+	spin_unlock_irqrestore(&pl.lock, f);
+	return HRTIMER_RESTART;
+}
 
 static unsigned long cpu_hw_rate, xo_rate;
 static bool icc_scaling_enabled;
@@ -110,96 +321,6 @@ static ssize_t show_hw_clk_domain(struct cpufreq_policy *policy, char *buf)
 }
 
 cpufreq_freq_attr_ro(hw_clk_domain);
-
-/*
- * show_voltage_lut - 現在の周波数ごとの電圧をuV単位で表示
- *
- * 各エントリについて、物理LUTの電圧と、リマップ後に実際にハードウェアへ
- * 送られるインデックス/電圧を並べて表示する。
- */
-static ssize_t show_voltage_lut(struct cpufreq_policy *policy, char *buf)
-{
-	struct qcom_cpufreq_data *data = policy->driver_data;
-	u32 raw_data, phys_volt, applied_volt;
-	int i, applied_idx, ret = 0;
-
-	for (i = 0; i < data->soc_data->lut_max_entries; i++) {
-		if (policy->freq_table[i].frequency == CPUFREQ_TABLE_END)
-			break;
-
-		/* 物理LUTの電圧 */
-		raw_data = readl_relaxed(data->base +
-					 data->soc_data->reg_volt_lut +
-					 i * data->soc_data->lut_row_size);
-		phys_volt = FIELD_GET(LUT_VOLT, raw_data) * 1000;
-
-		/* リマップ後インデックスと、そこが指す電圧 */
-		applied_idx = policy->freq_table[i].driver_data;
-		raw_data = readl_relaxed(data->base +
-					 data->soc_data->reg_volt_lut +
-					 applied_idx * data->soc_data->lut_row_size);
-		applied_volt = FIELD_GET(LUT_VOLT, raw_data) * 1000;
-
-		ret += scnprintf(buf + ret, PAGE_SIZE - ret,
-				 "[%d] %u kHz: Orig %u uV -> Applied %u uV (hw_index %d)\n",
-				 i,
-				 policy->freq_table[i].frequency,
-				 phys_volt,
-				 applied_volt,
-				 applied_idx);
-	}
-	return ret;
-}
-
-/*
- * store_voltage_lut は削除。
- *
- * reg_volt_lut は読み取り専用のステータスレジスタであり、
- * 直接書き込んでも電圧は変わらず、最悪フリーズを引き起こす。
- * 低電圧化は get_hacked_index() によるインデックスリマップで行う。
- */
-
-cpufreq_freq_attr_ro(voltage_lut);
-
-/*
- * get_hacked_index - 電圧差が UV_THRESHOLD_UV 未満であれば
- *                    より低いインデックスを返すことで低電圧化を実現する。
- *
- * 仕組み:
- *   reg_perf_state に書き込むインデックスを、同じ周波数のまま
- *   電圧の低いエントリへずらす。ハードウェアDCVSはそのインデックスで
- *   LUTを引くため、実際に供給される電圧が下がる。
- *
- * @v_table: 全エントリの物理電圧配列 (uV)
- * @i:       現在のエントリインデックス
- *
- * 戻り値: ハードウェアへ書き込むべきリマップ後インデックス
- */
-static int get_hacked_index(u32 *v_table, int i)
-{
-	int offset;
-
-	/* インデックス0はそのまま */
-	if (i == 0)
-		return 0;
-
-	/*
-	 * 最大8段下まで試みる。差分が UV_THRESHOLD_UV 未満で
-	 * かつ電圧が本当に下がっている場合にのみリマップする。
-	 * 大きいオフセットから試すことで最大限低い電圧を狙う。
-	 */
-	for (offset = 8; offset >= 1; offset--) {
-		if (i >= offset) {
-			u32 diff = v_table[i] - v_table[i - offset];
-
-			if (v_table[i] > v_table[i - offset] &&
-			    diff < UV_THRESHOLD_UV)
-				return i - offset;
-		}
-	}
-
-	return i;
-}
 
 static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 			       unsigned long freq_khz)
@@ -287,36 +408,32 @@ u64 qcom_cpufreq_get_cpu_cycle_counter(int cpu)
 }
 EXPORT_SYMBOL(qcom_cpufreq_get_cpu_cycle_counter);
 
-/*
- * qcom_cpufreq_hw_target_index - 周波数切り替えのメインパス
- *
- * ★ 修正点:
- *   policy->freq_table[index].driver_data に格納したリマップ後インデックスを
- *   reg_perf_state へ書き込む。これにより、ハードウェアDCVSは低い電圧の
- *   LUTエントリを参照するようになり、実際の供給電圧が下がる。
- */
 static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 					unsigned int index)
 {
 	struct qcom_cpufreq_data *data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
-	unsigned long freq = policy->freq_table[index].frequency;
-	/* リマップ後インデックスを取得 */
-	unsigned int mapped_index = policy->freq_table[index].driver_data;
+	unsigned long freq;
 	unsigned int i;
+
+	/* power limiter: clamp index to cap */
+	if (atomic_read(&pl.enabled) &&
+	    data->power_cap_index != U32_MAX &&
+	    index < data->power_cap_index)
+		index = data->power_cap_index;
+
+	freq = policy->freq_table[index].frequency;
 
 	if (soc_data->perf_lock_support) {
 		if (data->pdmem_base)
-			writel_relaxed(mapped_index, data->pdmem_base);
+			writel_relaxed(index, data->pdmem_base);
 	}
 
-	/* ★ mapped_index を書き込むことで低電圧LUTエントリを使わせる */
-	writel_relaxed(mapped_index, data->base + soc_data->reg_perf_state);
+	writel_relaxed(index, data->base + soc_data->reg_perf_state);
 
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
-			writel_relaxed(mapped_index,
-				       data->base + soc_data->reg_perf_state + i * 4);
+			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
 
 	if (icc_scaling_enabled)
 		qcom_cpufreq_set_bw(policy, freq);
@@ -374,45 +491,24 @@ static unsigned int qcom_cpufreq_hw_get(unsigned int cpu)
 	return qcom_cpufreq_get_freq(cpu);
 }
 
-/*
- * qcom_cpufreq_hw_fast_switch - 割り込みコンテキストからの高速周波数切り替え
- *
- * ★ 修正点:
- *   target_index と同様、mapped_index を reg_perf_state へ書き込む。
- *   fast_switch はスケジューラから直接呼ばれる高速パスのため、
- *   ここを修正しないと governor によっては低電圧化が効かない。
- */
 static unsigned int qcom_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
 						unsigned int target_freq)
 {
 	struct qcom_cpufreq_data *data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
-	unsigned int index = policy->cached_resolved_idx;
-	/* リマップ後インデックスを取得 */
-	unsigned int mapped_index = policy->freq_table[index].driver_data;
+	unsigned int index;
 	unsigned int i;
 
-	/* ★ mapped_index を書き込むことで低電圧LUTエントリを使わせる */
-	writel_relaxed(mapped_index, data->base + soc_data->reg_perf_state);
+	index = policy->cached_resolved_idx;
+	writel_relaxed(index, data->base + soc_data->reg_perf_state);
 
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
-			writel_relaxed(mapped_index,
-				       data->base + soc_data->reg_perf_state + i * 4);
+			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
 
 	return policy->freq_table[index].frequency;
 }
 
-/*
- * qcom_cpufreq_hw_read_lut - 起動時にLUTを読み取り周波数テーブルを構築する
- *
- * ★ 修正点:
- *   1. テーブル全エントリを table[i].driver_data = i で初期化し、
- *      未設定エントリが誤ってインデックス0にリマップされないようにする。
- *   2. get_hacked_index() で決定したリマップ後インデックスを driver_data に保存。
- *      target_index / fast_switch がこの値を reg_perf_state へ書き込む。
- *   3. reg_volt_lut への書き込みは行わない（読み取り専用レジスタのため）。
- */
 static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 				    struct cpufreq_policy *policy)
 {
@@ -425,21 +521,9 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 	struct qcom_cpufreq_data *drv_data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = drv_data->soc_data;
 
-	/* 物理電圧配列とリマップインデックス */
-	u32 phys_v[LUT_MAX_ENTRIES] = {0};
-	int hacked_idx;
-
 	table = kcalloc(soc_data->lut_max_entries + 1, sizeof(*table), GFP_KERNEL);
 	if (!table)
 		return -ENOMEM;
-
-	/*
-	 * ★ 修正点1: 全エントリを i→i のパススルーで初期化する。
-	 *    これにより、CPUFREQ_ENTRY_INVALID や未処理エントリが
-	 *    誤ってインデックス0へリマップされることを防ぐ。
-	 */
-	for (i = 0; i < soc_data->lut_max_entries; i++)
-		table[i].driver_data = i;
 
 	ret = dev_pm_opp_of_add_table(cpu_dev);
 	if (!ret) {
@@ -462,14 +546,6 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		icc_scaling_enabled = false;
 	}
 
-	/* ★ 修正点2: まず全エントリの物理電圧を読み出してキャッシュする */
-	for (i = 0; i < soc_data->lut_max_entries; i++) {
-		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
-				     i * soc_data->lut_row_size);
-		phys_v[i] = FIELD_GET(LUT_VOLT, data) * 1000; /* mV → uV */
-	}
-
-	/* ★ 修正点3: リマップインデックスを driver_data に格納してテーブルを構築 */
 	for (i = 0; i < soc_data->lut_max_entries; i++) {
 		data = readl_relaxed(drv_data->base + soc_data->reg_freq_lut +
 				      i * soc_data->lut_row_size);
@@ -480,39 +556,26 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		if (i == 0)
 			max_cc = core_count;
 
+		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
+				      i * soc_data->lut_row_size);
+		volt = FIELD_GET(LUT_VOLT, data) * 1000;
+
 		if (src)
 			freq = xo_rate * lval / 1000;
 		else
 			freq = cpu_hw_rate / 1000;
-
-		/*
-		 * リマップインデックスを決定し、そのインデックスが指す電圧を
-		 * OPPテーブルへ登録する。target_index / fast_switch が
-		 * このインデックスを reg_perf_state へ書き込むことで
-		 * ハードウェアに低い電圧を要求させる。
-		 */
-		hacked_idx = get_hacked_index(phys_v, i);
-		volt = phys_v[hacked_idx];
 
 		if (core_count == LUT_TURBO_IND && soc_data->turbo_ind_support)
 			table[i].frequency = CPUFREQ_ENTRY_INVALID;
 		else if (freq != prev_freq) {
 			if (!qcom_cpufreq_update_opp(cpu_dev, freq, volt)) {
 				table[i].frequency = freq;
-				/* ★ リマップインデックスを保存 */
-				table[i].driver_data = hacked_idx;
-
 				if (core_count < max_cc)
 					table[i].flags = CPUFREQ_BOOST_FREQ;
-
-				dev_dbg(cpu_dev,
-					"index=%d freq=%d core_count=%d "
-					"orig_volt=%u uV -> mapped_idx=%d volt=%u uV\n",
-					i, freq, core_count,
-					phys_v[i], hacked_idx, volt);
+				dev_dbg(cpu_dev, "index=%d freq=%d, core_count %d\n", i,
+				freq, core_count);
 			} else {
-				dev_warn(cpu_dev,
-					 "failed to update OPP for freq=%d\n", freq);
+				dev_warn(cpu_dev, "failed to update OPP for freq=%d\n", freq);
 				table[i].frequency = CPUFREQ_ENTRY_INVALID;
 			}
 		}
@@ -532,13 +595,12 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 				if (!qcom_cpufreq_update_opp(cpu_dev, prev_freq, volt)) {
 					prev->frequency = prev_freq;
 					prev->flags = CPUFREQ_BOOST_FREQ;
-					prev->driver_data = hacked_idx;
 				} else {
-					dev_warn(cpu_dev,
-						 "failed to update OPP for freq=%d\n",
+					dev_warn(cpu_dev, "failed to update OPP for freq=%d\n",
 						 freq);
 				}
 			}
+
 			break;
 		}
 
@@ -801,7 +863,7 @@ static int qcom_cpufreq_hw_lmh_init(struct cpufreq_policy *policy, int index,
 				   IRQF_ONESHOT | IRQF_NO_AUTOEN, data->irq_name, data);
 	if (ret) {
 		dev_err(&pdev->dev, "Error registering %s: %d\n", data->irq_name, ret);
-		return ret;
+		return 0;
 	}
 
 	ret = irq_set_affinity_and_hint(data->throttle_irq, policy->cpus);
@@ -998,6 +1060,18 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	if (ret)
 		goto error;
 
+	/* power limiter init */
+	data->power_cap_index = U32_MAX;
+	{
+		unsigned long f; int pi, already = 0;
+		spin_lock_irqsave(&pl.lock, f);
+		for (pi = 0; pi < pl.n_policies; pi++)
+			if (pl.policies[pi] == policy) { already = 1; break; }
+		if (!already && pl.n_policies < PL_MAX_POLICIES)
+			pl.policies[pl.n_policies++] = policy;
+		spin_unlock_irqrestore(&pl.lock, f);
+	}
+
 	return 0;
 error:
 	policy->driver_data = NULL;
@@ -1007,6 +1081,18 @@ error:
 static int qcom_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
 {
 	struct device *cpu_dev = get_cpu_device(policy->cpu);
+	unsigned long f; int i;
+
+	/* unregister from power limiter */
+	spin_lock_irqsave(&pl.lock, f);
+	for (i = 0; i < pl.n_policies; i++) {
+		if (pl.policies[i] == policy) {
+			pl.policies[i] = pl.policies[--pl.n_policies];
+			pl.policies[pl.n_policies] = NULL;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&pl.lock, f);
 
 	qcom_cpufreq_hw_lmh_exit(policy->driver_data);
 	dev_pm_opp_remove_all_dynamic(cpu_dev);
@@ -1027,7 +1113,6 @@ static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
 static struct freq_attr *qcom_cpufreq_hw_attr[] = {
 	&cpufreq_freq_attr_scaling_available_freqs,
 	&cpufreq_freq_attr_scaling_boost_freqs,
-	&voltage_lut,
 	NULL
 };
 
@@ -1085,16 +1170,45 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		spin_lock_init(&qcom_cpufreq_counter[cpu].lock);
 
 	ret = cpufreq_register_driver(&cpufreq_qcom_hw_driver);
-	if (ret)
+	if (ret) {
 		dev_err(&pdev->dev, "CPUFreq HW driver failed to register\n");
-	else
-		dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
+		return ret;
+	}
+	dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
 
-	return ret;
+	/* power limiter: init state */
+	atomic_set(&pl.target_mw, 0);
+	atomic_set(&pl.actual_mw, 0);
+	atomic_set(&pl.enabled,   0);
+	spin_lock_init(&pl.lock);
+	pl.n_policies = 0;
+	pl.settle     = 0;
+
+	/* sysfs: /sys/kernel/power_limiter/ */
+	pl.kobj = kobject_create_and_add("power_limiter", kernel_kobj);
+	if (pl.kobj) {
+		if (sysfs_create_group(pl.kobj, &pl_attr_grp))
+			dev_warn(&pdev->dev, "power_limiter sysfs failed\n");
+	} else {
+		dev_warn(&pdev->dev, "power_limiter kobject failed\n");
+	}
+
+	/* start hrtimer (disabled until echo 1 > enabled) */
+	hrtimer_init(&pl.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	pl.timer.function = pl_timer_fn;
+	hrtimer_start(&pl.timer, ns_to_ktime(PL_POLL_NS), HRTIMER_MODE_REL);
+
+	return 0;
 }
 
 static int qcom_cpufreq_hw_driver_remove(struct platform_device *pdev)
 {
+	hrtimer_cancel(&pl.timer);
+	if (pl.kobj) {
+		sysfs_remove_group(pl.kobj, &pl_attr_grp);
+		kobject_put(pl.kobj);
+		pl.kobj = NULL;
+	}
 	return cpufreq_unregister_driver(&cpufreq_qcom_hw_driver);
 }
 
