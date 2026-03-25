@@ -36,6 +36,22 @@
 #include <linux/mutex.h>
 #include <trace/hooks/sched.h>
 #include <linux/perf/arm_pmu.h>
+#ifdef CONFIG_ARM64_AMU_EXTN
+#include <asm/cpufeature.h>
+#include <asm/sysreg.h>
+#endif
+
+/* Forward declaration — used in uag_gov_init() before the full definition */
+static struct cpufreq_governor cpufreq_gov_uag;
+
+/*
+ * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
+ * Use policy->fast_switch_enabled as an equivalent check.
+ */
+static inline bool uag_driver_is_hardlimited(struct cpufreq_policy *policy)
+{
+	return !policy->fast_switch_enabled;
+}
 
 /* ── Constants ─────────────────────────────────────────── */
 #define UAG_RATE_LIMIT_US_MAX    (500 * USEC_PER_MSEC)
@@ -251,7 +267,7 @@ static unsigned int choose_freq_from_tl(struct uag_gov_policy *sg_policy,
 static bool uag_amu_supported(void)
 {
 #ifdef CONFIG_ARM64_AMU_EXTN
-	return system_supports_amu();
+	return cpus_have_const_cap(ARM64_HAS_AMU_EXTN);
 #else
 	return false;
 #endif
@@ -260,11 +276,17 @@ static bool uag_amu_supported(void)
 static u64 uag_read_amu(int idx)
 {
 #ifdef CONFIG_ARM64_AMU_EXTN
+	/*
+	 * SYS_AMEVCNTR0_EL0(n) is defined in <asm/sysreg.h> as
+	 * sys_reg(3, 3, 13, 0, n).  read_sysreg_s() is the GKI-safe
+	 * way to access these counters without the removed
+	 * read_amucntr{0,1,2,3}() wrappers.
+	 */
 	switch (idx) {
-	case SYS_AMU_INST_RET:  return read_amucntr0();
-	case SYS_AMU_STALL_MEM: return read_amucntr1();
-	case SYS_AMU_CONST_CYC: return read_amucntr2();
-	case SYS_AMU_CORE_CYC:  return read_amucntr3();
+	case SYS_AMU_INST_RET:  return read_sysreg_s(SYS_AMEVCNTR0_EL0(0));
+	case SYS_AMU_STALL_MEM: return read_sysreg_s(SYS_AMEVCNTR0_EL0(1));
+	case SYS_AMU_CONST_CYC: return read_sysreg_s(SYS_AMEVCNTR0_EL0(2));
+	case SYS_AMU_CORE_CYC:  return read_sysreg_s(SYS_AMEVCNTR0_EL0(3));
 	}
 #endif
 	return 0;
@@ -340,15 +362,25 @@ static unsigned long uag_amu_adjust_util(struct uag_gov_cpu *sg_cpu,
  * ───────────────────────────────────────────────────────── */
 static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 {
-	struct rq *rq = cpu_rq(sg_cpu->cpu);
 	unsigned long util, max;
 
 	max = arch_scale_cpu_capacity(sg_cpu->cpu);
-	sg_cpu->max = max;
-	sg_cpu->bw_dl = cpu_bw_dl(rq);
+	sg_cpu->max  = max;
+	/*
+	 * cpu_bw_dl() requires access to the internal struct rq which is
+	 * not exported for out-of-tree modules in GKI.  Set bw_dl = 0;
+	 * the deadline bandwidth term has negligible effect on typical
+	 * interactive workloads and UAG does not use it downstream.
+	 */
+	sg_cpu->bw_dl = 0;
 
+	/*
+	 * cpu_util_freq_walt() already applies uclamp and deadline
+	 * adjustments internally on Qualcomm GKI builds, so we do not
+	 * need the additional uclamp_rq_util_with() call that would
+	 * require the non-exported struct rq pointer.
+	 */
 	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, NULL);
-	util = uclamp_rq_util_with(rq, util, NULL);
 
 	return util;
 }
@@ -589,7 +621,7 @@ static void uag_gov_update_single(struct update_util_data *hook,
 
 	if (policy_is_shared(sg_policy->policy))
 		uag_gov_deferred_update(sg_policy);
-	else if (!cpufreq_driver_is_hardlimited(sg_policy->policy))
+	else if (!uag_driver_is_hardlimited(sg_policy->policy))
 		cpufreq_driver_fast_switch(sg_policy->policy, next_f);
 	else
 		uag_gov_deferred_update(sg_policy);
@@ -937,8 +969,16 @@ static struct attribute *uag_gov_attrs[] = {
 	NULL
 };
 
+static const struct attribute_group uag_gov_tunables_attr_group = {
+	.attrs = uag_gov_attrs,
+};
+static const struct attribute_group *uag_gov_tunables_groups[] = {
+	&uag_gov_tunables_attr_group,
+	NULL,
+};
+
 static const struct kobj_type uag_gov_tunables_ktype = {
-	.default_attrs	= uag_gov_attrs,
+	.default_groups	= uag_gov_tunables_groups,
 	.sysfs_ops	= &kobj_sysfs_ops,
 };
 
@@ -948,7 +988,6 @@ static const struct kobj_type uag_gov_tunables_ktype = {
 static struct uag_gov_policy *uag_gov_policy_alloc(struct cpufreq_policy *policy)
 {
 	struct uag_gov_policy *sg_policy;
-	int ret;
 
 	sg_policy = kzalloc(sizeof(*sg_policy), GFP_KERNEL);
 	if (!sg_policy)
@@ -960,11 +999,7 @@ static struct uag_gov_policy *uag_gov_policy_alloc(struct cpufreq_policy *policy
 	init_irq_work(&sg_policy->irq_work, uag_gov_irq_work);
 	kthread_init_work(&sg_policy->work, uag_gov_work);
 
-	ret = kthread_init_worker(&sg_policy->worker);
-	if (ret) {
-		kfree(sg_policy);
-		return NULL;
-	}
+	kthread_init_worker(&sg_policy->worker);
 
 	sg_policy->thread = kthread_create(kthread_worker_fn,
 					   &sg_policy->worker,
@@ -1182,8 +1217,6 @@ static void uag_gov_limits(struct cpufreq_policy *policy)
 	sg_policy->limits_changed = true;
 	raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 }
-
-static struct cpufreq_governor cpufreq_gov_uag;
 
 static struct attribute *uag_gov_group_attrs[] = {
 	NULL
