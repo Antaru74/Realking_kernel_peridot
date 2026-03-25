@@ -17,6 +17,10 @@ obj-$(CONFIG_CPU_FREQ_GOV_CONSERVATIVE)	+= cpufreq_conservative.o
 obj-$(CONFIG_CPU_FREQ_GOV_COMMON)	+= cpufreq_governor.o
 obj-$(CONFIG_CPU_FREQ_GOV_ATTR_SET)	+= cpufreq_governor_attr_set.o
 
+# UAG (Util-Aware Governor) - リバエン再構築ソース
+# 元ネタ: OPlus/Qualcomm cpufreq_uag.ko の strings 解析から再構築
+obj-$(CONFIG_CPU_FREQ_GOV_UAG)		+= cpufreq_uag.o
+
 # util_scale: android_vh_map_util_freq フック経由で
 # schedutil / walt / UAG (cpufreq_uag.ko) の全ガバナーに
 # util_scale_pct スケーリングを適用する。
