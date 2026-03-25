@@ -14,8 +14,17 @@ obj-$(CONFIG_CPU_FREQ_GOV_POWERSAVE)	+= cpufreq_powersave.o
 obj-$(CONFIG_CPU_FREQ_GOV_USERSPACE)	+= cpufreq_userspace.o
 obj-$(CONFIG_CPU_FREQ_GOV_ONDEMAND)	+= cpufreq_ondemand.o
 obj-$(CONFIG_CPU_FREQ_GOV_CONSERVATIVE)	+= cpufreq_conservative.o
-obj-$(CONFIG_CPU_FREQ_GOV_COMMON)		+= cpufreq_governor.o
+obj-$(CONFIG_CPU_FREQ_GOV_COMMON)	+= cpufreq_governor.o
 obj-$(CONFIG_CPU_FREQ_GOV_ATTR_SET)	+= cpufreq_governor_attr_set.o
+
+# util_scale: android_vh_map_util_freq フック経由で
+# schedutil / walt / UAG (cpufreq_uag.ko) の全ガバナーに
+# util_scale_pct スケーリングを適用する。
+# UAG はクローズドソースのため直接改変できないが、
+# このモジュールの vendor hook で対応可能。
+# ※ cpufreq_walt.c は kernel/sched/walt/ でビルド
+# ※ cpufreq_schedutil.c は kernel/sched/ でビルド
+obj-$(CONFIG_CPU_FREQ_UTIL_SCALE)	+= cpufreq_util_scale.o
 
 obj-$(CONFIG_CPUFREQ_DT)		+= cpufreq-dt.o
 obj-$(CONFIG_CPUFREQ_DT_PLATDEV)	+= cpufreq-dt-platdev.o
@@ -28,11 +37,6 @@ amd_pstate-y				:= amd-pstate.o amd-pstate-trace.o
 
 ##################################################################################
 # x86 drivers.
-# Link order matters. K8 is preferred to ACPI because of firmware bugs in early
-# K8 systems. This is still the case but acpi-cpufreq errors out so that
-# powernow-k8 can load then. ACPI is preferred to all other hardware-specific drivers.
-# speedstep-* is preferred over p4-clockmod.
-
 obj-$(CONFIG_X86_ACPI_CPUFREQ)		+= acpi-cpufreq.o
 obj-$(CONFIG_X86_AMD_PSTATE)		+= amd_pstate.o
 obj-$(CONFIG_X86_AMD_PSTATE_UT)		+= amd-pstate-ut.o
