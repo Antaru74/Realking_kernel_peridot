@@ -45,10 +45,11 @@
 static struct cpufreq_governor cpufreq_gov_uag;
 
 /*
- * cpu_util_freq_walt() is not present in this kernel's vmlinux.
- * Use the GKI-standard cpu_util_cfs() from <linux/sched/cpufreq.h>
- * which provides the same CFS utilisation signal used by schedutil.
+ * cpu_util_cfs() is defined in kernel/sched/fair.c and used by schedutil,
+ * so it is guaranteed to exist in vmlinux. It is not declared in any public
+ * header, so we declare the prototype directly.
  */
+extern unsigned long cpu_util_cfs(int cpu);
 
 /*
  * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
