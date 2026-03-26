@@ -742,6 +742,7 @@ cpu_util_freq_walt(int cpu, struct walt_cpu_load *walt_load, unsigned int *reaso
 finish:
 	return (util >= capacity) ? capacity : util;
 }
+EXPORT_SYMBOL_GPL(cpu_util_freq_walt);
 
 /*
  * In this function we match the accumulated subtractions with the current
