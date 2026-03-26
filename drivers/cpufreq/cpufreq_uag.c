@@ -32,7 +32,6 @@
 #include <linux/kthread.h>
 #include <linux/irq_work.h>
 #include <linux/sched.h>
-#include <linux/sched/types.h>   /* full struct sched_attr definition */
 #include <linux/sched/cpufreq.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -53,15 +52,6 @@
  * This is the closest util signal available to loadable modules.
  */
 extern unsigned long sched_cpu_util(int cpu);
-
-/*
- * SCHED_FLAG_SUGOV enables SCHED_DEADLINE without real bandwidth admission.
- * Defined in include/linux/sched.h for built-in code; may not be visible
- * to modules on all builds, so guard it.
- */
-#ifndef SCHED_FLAG_SUGOV
-#define SCHED_FLAG_SUGOV	0x100
-#endif
 
 /* Forward declarations */
 static struct cpufreq_governor cpufreq_gov_uag;
@@ -1296,25 +1286,18 @@ static void uag_policy_free(struct uag_gov_policy *sg_policy)
 }
 
 /*
- * kthread create — follows schedutil exactly:
- *   SCHED_DEADLINE with SCHED_FLAG_SUGOV, bound to policy CPUs.
- *   Only created when fast_switch is NOT available (slow path).
+ * kthread create — only needed for the slow path (no fast_switch).
+ *
+ * The built-in schedutil uses SCHED_DEADLINE with SCHED_FLAG_SUGOV,
+ * but struct sched_attr is not exported to GKI modules (forward-declared
+ * only in linux/sched.h).  sched_set_fifo_low() gives RT FIFO priority
+ * which is sufficient — the kthread just calls __cpufreq_driver_target()
+ * and doesn't need deadline guarantees.
  */
 static int uag_kthread_create(struct uag_gov_policy *sg_policy)
 {
 	struct task_struct *thread;
-	struct sched_attr attr = {
-		.size		= sizeof(struct sched_attr),
-		.sched_policy	= SCHED_DEADLINE,
-		.sched_flags	= SCHED_FLAG_SUGOV,
-		.sched_nice	= 0,
-		.sched_priority	= 0,
-		.sched_runtime	=  1000000,
-		.sched_deadline = 10000000,
-		.sched_period	= 10000000,
-	};
 	struct cpufreq_policy *policy = sg_policy->policy;
-	int ret;
 
 	/* kthread only required for slow path */
 	if (policy->fast_switch_enabled)
@@ -1331,23 +1314,7 @@ static int uag_kthread_create(struct uag_gov_policy *sg_policy)
 		return PTR_ERR(thread);
 	}
 
-	ret = sched_setattr_nocheck(thread, &attr);
-	if (ret) {
-		kthread_stop(thread);
-		pr_warn("cpufreq_uag: failed to set SCHED_DEADLINE, "
-			"falling back to FIFO\n");
-		/*
-		 * Fallback: re-create with FIFO if DEADLINE fails.
-		 * Some GKI builds don't allow SCHED_FLAG_SUGOV from modules.
-		 */
-		thread = kthread_create(kthread_worker_fn,
-					&sg_policy->worker,
-					"uag:%d",
-					cpumask_first(policy->related_cpus));
-		if (IS_ERR(thread))
-			return PTR_ERR(thread);
-		sched_set_fifo_low(thread);
-	}
+	sched_set_fifo_low(thread);
 
 	sg_policy->thread = thread;
 	kthread_bind_mask(thread, policy->related_cpus);
