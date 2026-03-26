@@ -57,7 +57,7 @@ extern unsigned long sched_cpu_util(int cpu);
 static struct cpufreq_governor cpufreq_gov_uag;
 
 /* ── Constants ─────────────────────────────────────────── */
-#define DEFAULT_TARGET_LOAD      90
+#define DEFAULT_TARGET_LOAD      80
 #define DEFAULT_HISPEED_LOAD     90
 #define DEFAULT_UP_RATE_LIMIT    500    /* µs */
 #define DEFAULT_DOWN_RATE_LIMIT  2000   /* µs */
@@ -480,18 +480,39 @@ static unsigned int choose_freq_from_tl(struct uag_gov_policy *sg_policy,
 	struct cpufreq_policy *policy = sg_policy->policy;
 	struct uag_gov_tunables *tunables = sg_policy->tunables;
 	struct cpufreq_frequency_table *freq_table = policy->freq_table;
+	unsigned int max_freq = policy->cpuinfo.max_freq;
 	unsigned int freq, tl;
 	int i;
 
 	freq = 0;
 
-	/* Walk freq table: find lowest freq where util/max <= tl/100 */
+	/*
+	 * Walk freq table ascending: find lowest freq whose capacity,
+	 * scaled by target_load, can accommodate the requested util.
+	 *
+	 * cap_at_f = max_capacity * f / max_freq
+	 *
+	 * This replicates the original UAG's nlopp_map_util_freq() which
+	 * uses oplus_cap_multiple[] — a per-OPP capacity table.  Without
+	 * the OPLUS symbols we compute capacity from the linear model,
+	 * which is exact on freq-invariant ARM (capacity ∝ frequency).
+	 *
+	 * The previous code compared against max (always 1024), making
+	 * the check identical for all frequencies → binary behavior.
+	 */
 	for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
 		unsigned int f = freq_table[i].frequency;
+		unsigned long cap_at_f;
+
 		if (f == CPUFREQ_ENTRY_INVALID)
 			continue;
+
 		tl = freq_to_targetload(tunables, f);
-		if (util * 100 <= (unsigned long)tl * max) {
+
+		/* Capacity this OPP provides: proportional to freq */
+		cap_at_f = max * f / max_freq;
+
+		if (util * 100 <= (unsigned long)tl * cap_at_f) {
 			freq = f;
 			break;
 		}
@@ -722,37 +743,19 @@ static bool uag_update_next_freq(struct uag_gov_policy *sg_policy,
 /* ═══════════════════════════════════════════════════════════════════════
  * Main frequency calculation
  *
- * Base frequency uses schedutil's proven linear formula:
- *   next_freq = C * max_freq * util / max,  where C = 1.25
+ * Frequency is always selected via choose_freq_from_tl(), which walks
+ * the OPP table comparing util against per-OPP capacity scaled by
+ * target_load.  This matches the original UAG's nlopp + update_util_tl
+ * pipeline.
  *
- * When target_loads has multiple entries (user-configured), the table-walk
- * approach overrides the linear base — this is the "interactive governor"
- * style that the original OnePlus UAG uses with device-tuned tables.
+ * With the default single-entry target_loads={80}, the mapping is
+ * equivalent to schedutil's C=1.25 headroom: each OPP is selected
+ * when util reaches 80% of its capacity (1/0.8 = 1.25x headroom).
+ *
+ * With user-configured multi-entry target_loads, the curve can be
+ * shaped per frequency range — this is the "interactive governor"
+ * style tuning that OnePlus uses with vendor-specific tables.
  * ═══════════════════════════════════════════════════════════════════════ */
-
-/*
- * get_base_freq — schedutil's linear util→freq mapping.
- * map_util_perf() and map_util_freq() are static inlines from
- * <linux/sched/cpufreq.h>, always available.
- */
-static unsigned int get_base_freq(struct uag_gov_policy *sg_policy,
-				   unsigned long util, unsigned long max)
-{
-	struct cpufreq_policy *policy = sg_policy->policy;
-	unsigned int freq;
-
-	freq = arch_scale_freq_invariant() ?
-		policy->cpuinfo.max_freq : policy->cur;
-
-	util = map_util_perf(util);        /* C = 1.25 headroom */
-	freq = map_util_freq(util, freq, max);
-
-	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
-		return sg_policy->next_freq;
-
-	sg_policy->cached_raw_freq = freq;
-	return cpufreq_driver_resolve_freq(policy, freq);
-}
 
 static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 					unsigned long util, unsigned long max)
@@ -766,16 +769,7 @@ static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 	if (tunables->util_scale_pct > 0 && tunables->util_scale_pct < 100)
 		scaled_util = util * tunables->util_scale_pct / 100;
 
-	/*
-	 * Frequency selection strategy:
-	 *   ntarget_loads > 1 → user has configured a multi-entry table,
-	 *                       use interactive-governor style table walk.
-	 *   ntarget_loads <= 1 → default, use schedutil linear mapping.
-	 */
-	if (tunables->ntarget_loads > 1)
-		freq = choose_freq_from_tl(sg_policy, scaled_util, max);
-	else
-		freq = get_base_freq(sg_policy, scaled_util, max);
+	freq = choose_freq_from_tl(sg_policy, scaled_util, max);
 
 	/* hispeed boost */
 	if (tunables->hispeed_freq) {
