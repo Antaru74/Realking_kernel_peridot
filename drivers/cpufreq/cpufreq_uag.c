@@ -40,6 +40,7 @@
 #include <linux/atomic.h>
 #include <linux/rcupdate.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
 #include <trace/hooks/sched.h>
 #ifdef CONFIG_ARM64_AMU_EXTN
 #include <asm/cpufeature.h>
@@ -132,6 +133,21 @@ struct uag_gov_tunables {
 
 	/* util_scale_pct: UV/power reduction feature */
 	unsigned int util_scale_pct;    /* 1-100, default 100 */
+
+	/* ── SchedTune-equivalent boost ──
+	 * Applies: util += (max - util) * stune_boost_pct / 100
+	 * At 0: no effect.  At 10: adds 10% of remaining headroom.
+	 * Identical formula to schedtune/uclamp boost.
+	 */
+	unsigned int stune_boost_pct;   /* 0-100, default 0 */
+
+	/* ── Frame boost ──
+	 * When /proc/uag/frame_boost is triggered by userspace,
+	 * clamp freq at or above frame_boost_freq for the duration.
+	 * Replicates fbg_freq_policy_util effect.
+	 */
+	unsigned int frame_boost_freq;          /* kHz, 0 = disabled */
+	unsigned int frame_boost_duration_us;   /* µs, default 8000 (8ms) */
 };
 
 /* ── Policy state ───────────────────────────────────────── */
@@ -158,6 +174,9 @@ struct uag_gov_policy {
 
 	bool limits_changed;
 	bool need_freq_update;
+
+	/* frame boost: last trigger timestamp (ns), atomic for lock-free read */
+	atomic64_t frame_boost_ts;
 };
 
 /* ── Per-cpu state ──────────────────────────────────────── */
@@ -190,6 +209,15 @@ static DEFINE_MUTEX(global_tunables_lock);
 
 /* proc entry root */
 static struct proc_dir_entry *uag_proc_root;
+
+/*
+ * Frame boost: per-cluster policy pointers for proc interface.
+ * Userspace writes the first CPU of a cluster to /proc/uag/frame_boost
+ * and the governor stamps frame_boost_ts on that policy.
+ * Max 4 clusters (little/big/prime/+1 is the most seen on mobile SoCs).
+ */
+#define UAG_MAX_CLUSTERS	4
+static struct uag_gov_policy *uag_cluster_policy[UAG_MAX_CLUSTERS];
 
 /* ── Default target loads (static, never freed) ────────── */
 static unsigned int default_target_loads[] = { DEFAULT_TARGET_LOAD };
@@ -615,6 +643,21 @@ static void uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	/* UALT enhancement */
 	util = ualt_update(sg_cpu->cpu, raw, sg_cpu->max, now);
 
+	/*
+	 * SchedTune-equivalent boost.
+	 * Formula: util += (max - util) * boost_pct / 100
+	 * This adds a fraction of the remaining headroom, pushing util
+	 * toward max without exceeding it.  Identical to the kernel's
+	 * schedutil_cpu_util() boost and OPLUS get_effect_stune_boost().
+	 */
+	{
+		struct uag_gov_tunables *t = sg_cpu->sg_policy->tunables;
+		if (t && t->stune_boost_pct > 0) {
+			unsigned long headroom = sg_cpu->max - util;
+			util += headroom * t->stune_boost_pct / 100;
+		}
+	}
+
 	sg_cpu->util = util;
 }
 
@@ -780,6 +823,24 @@ static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 	}
 
 	freq = uag_apply_soft_limit(sg_policy, freq, scaled_util, max);
+
+	/*
+	 * Frame boost: if triggered recently, clamp freq at or above
+	 * frame_boost_freq.  The timestamp is set atomically by the
+	 * /proc/uag/frame_boost write handler — no lock needed here.
+	 */
+	if (tunables->frame_boost_freq > 0) {
+		u64 fb_ts = (u64)atomic64_read(&sg_policy->frame_boost_ts);
+		if (fb_ts) {
+			u64 now = ktime_get_ns();
+			u64 dur = (u64)tunables->frame_boost_duration_us *
+				  NSEC_PER_USEC;
+			if ((s64)(now - fb_ts) < (s64)dur) {
+				if (freq < tunables->frame_boost_freq)
+					freq = tunables->frame_boost_freq;
+			}
+		}
+	}
 
 	return clamp(freq, policy->min, policy->max);
 }
@@ -1270,6 +1331,58 @@ static ssize_t util_scale_pct_store(struct gov_attr_set *s,
 }
 static struct governor_attr util_scale_pct_attr = __ATTR_RW(util_scale_pct);
 
+/* ── stune_boost_pct ── */
+static ssize_t stune_boost_pct_show(struct gov_attr_set *s, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 to_uag_tunables(s)->stune_boost_pct);
+}
+static ssize_t stune_boost_pct_store(struct gov_attr_set *s,
+				      const char *buf, size_t count)
+{
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val) || val > 100)
+		return -EINVAL;
+	to_uag_tunables(s)->stune_boost_pct = val;
+	return count;
+}
+static struct governor_attr stune_boost_pct_attr = __ATTR_RW(stune_boost_pct);
+
+/* ── frame_boost_freq ── */
+static ssize_t frame_boost_freq_show(struct gov_attr_set *s, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 to_uag_tunables(s)->frame_boost_freq);
+}
+static ssize_t frame_boost_freq_store(struct gov_attr_set *s,
+				       const char *buf, size_t count)
+{
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	to_uag_tunables(s)->frame_boost_freq = val;
+	return count;
+}
+static struct governor_attr frame_boost_freq_attr = __ATTR_RW(frame_boost_freq);
+
+/* ── frame_boost_duration_us ── */
+static ssize_t frame_boost_duration_us_show(struct gov_attr_set *s, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 to_uag_tunables(s)->frame_boost_duration_us);
+}
+static ssize_t frame_boost_duration_us_store(struct gov_attr_set *s,
+					      const char *buf, size_t count)
+{
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	to_uag_tunables(s)->frame_boost_duration_us = val;
+	return count;
+}
+static struct governor_attr frame_boost_duration_us_attr =
+	__ATTR_RW(frame_boost_duration_us);
+
 static struct attribute *uag_gov_attrs[] = {
 	&target_loads_attr.attr,
 	&up_rate_limit_us_attr.attr,
@@ -1286,6 +1399,9 @@ static struct attribute *uag_gov_attrs[] = {
 	&multi_tl_enable_attr.attr,
 	&cobuck_enable_attr.attr,
 	&util_scale_pct_attr.attr,
+	&stune_boost_pct_attr.attr,
+	&frame_boost_freq_attr.attr,
+	&frame_boost_duration_us_attr.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(uag_gov);
@@ -1428,6 +1544,9 @@ static struct uag_gov_tunables *uag_tunables_alloc(struct uag_gov_policy *sg_pol
 	tunables->multi_tl_enable    = false;
 	tunables->cobuck_enable      = false;
 	tunables->util_scale_pct     = 100;
+	tunables->stune_boost_pct    = 0;
+	tunables->frame_boost_freq   = 0;    /* disabled by default */
+	tunables->frame_boost_duration_us = 8000; /* 8ms ≈ half a 60fps frame */
 
 	return tunables;
 }
@@ -1568,6 +1687,14 @@ static int uag_gov_start(struct cpufreq_policy *policy)
 	sg_policy->need_freq_update =
 		cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
 
+	/* frame boost: clear timestamp, register cluster */
+	atomic64_set(&sg_policy->frame_boost_ts, 0);
+	{
+		int cid = topology_cluster_id(cpumask_first(policy->cpus));
+		if (cid >= 0 && cid < UAG_MAX_CLUSTERS)
+			uag_cluster_policy[cid] = sg_policy;
+	}
+
 	for_each_cpu(cpu, policy->cpus) {
 		struct uag_gov_cpu *sg_cpu = &per_cpu(uag_gov_cpu, cpu);
 
@@ -1596,6 +1723,7 @@ static void uag_gov_stop(struct cpufreq_policy *policy)
 {
 	struct uag_gov_policy *sg_policy = policy->governor_data;
 	unsigned int cpu;
+	int cid;
 
 	for_each_cpu(cpu, policy->cpus)
 		cpufreq_remove_update_util_hook(cpu);
@@ -1606,6 +1734,12 @@ static void uag_gov_stop(struct cpufreq_policy *policy)
 		irq_work_sync(&sg_policy->irq_work);
 		kthread_cancel_work_sync(&sg_policy->work);
 	}
+
+	/* Unregister cluster mapping */
+	cid = topology_cluster_id(cpumask_first(policy->cpus));
+	if (cid >= 0 && cid < UAG_MAX_CLUSTERS &&
+	    uag_cluster_policy[cid] == sg_policy)
+		uag_cluster_policy[cid] = NULL;
 }
 
 static void uag_gov_limits(struct cpufreq_policy *policy)
@@ -1702,6 +1836,125 @@ static const struct proc_ops uag_pd_capacity_ops = {
 	.proc_release = single_release,
 };
 
+/*
+ * /proc/uag/frame_boost — userspace frame-boost trigger.
+ *
+ * Write semantics:
+ *   "0"   → trigger boost on cluster 0 (little)
+ *   "1"   → trigger boost on cluster 1 (big)
+ *   "2"   → trigger boost on cluster 2 (prime)
+ *   "-1"  → trigger boost on ALL clusters
+ *
+ * Each write stamps the current ktime on the target cluster's
+ * frame_boost_ts.  The governor then holds freq at or above
+ * frame_boost_freq for frame_boost_duration_us.
+ *
+ * Typical callers: SurfaceFlinger, PerformanceService, game booster.
+ * This replaces the OPLUS fbg_freq_policy_util / fbg_add_update_freq_hook
+ * path which is not available without OPLUS symbols.
+ */
+static ssize_t uag_frame_boost_write(struct file *file,
+				      const char __user *ubuf,
+				      size_t count, loff_t *ppos)
+{
+	char buf[16];
+	int cluster_id;
+	u64 now;
+	int i;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &cluster_id))
+		return -EINVAL;
+
+	now = ktime_get_ns();
+
+	if (cluster_id < 0) {
+		/* Boost all clusters */
+		for (i = 0; i < UAG_MAX_CLUSTERS; i++) {
+			if (uag_cluster_policy[i])
+				atomic64_set(&uag_cluster_policy[i]->frame_boost_ts,
+					     (s64)now);
+		}
+	} else if (cluster_id < UAG_MAX_CLUSTERS &&
+		   uag_cluster_policy[cluster_id]) {
+		atomic64_set(&uag_cluster_policy[cluster_id]->frame_boost_ts,
+			     (s64)now);
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+/*
+ * Read shows the time-since-last-boost per cluster (ms) for debugging.
+ */
+static int uag_frame_boost_show(struct seq_file *m, void *v)
+{
+	u64 now = ktime_get_ns();
+	int i;
+
+	for (i = 0; i < UAG_MAX_CLUSTERS; i++) {
+		struct uag_gov_policy *sgp = uag_cluster_policy[i];
+		if (!sgp) {
+			seq_printf(m, "cluster%d: inactive\n", i);
+			continue;
+		}
+		{
+			u64 ts = (u64)atomic64_read(&sgp->frame_boost_ts);
+			if (ts) {
+				u64 delta_ms = div64_u64(now - ts, 1000000ULL);
+				seq_printf(m, "cluster%d: %llu ms ago\n",
+					   i, delta_ms);
+			} else {
+				seq_printf(m, "cluster%d: never\n", i);
+			}
+		}
+	}
+	return 0;
+}
+
+static int uag_frame_boost_open(struct inode *i, struct file *f)
+{
+	return single_open(f, uag_frame_boost_show, NULL);
+}
+
+static const struct proc_ops uag_frame_boost_ops = {
+	.proc_open    = uag_frame_boost_open,
+	.proc_read    = seq_read,
+	.proc_write   = uag_frame_boost_write,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+/*
+ * Exported function for in-kernel callers (e.g. display driver hooks).
+ * Stamps frame_boost on the specified cluster.  cluster_id = -1 for all.
+ */
+void uag_trigger_frame_boost(int cluster_id)
+{
+	u64 now = ktime_get_ns();
+	int i;
+
+	if (cluster_id < 0) {
+		for (i = 0; i < UAG_MAX_CLUSTERS; i++) {
+			if (uag_cluster_policy[i])
+				atomic64_set(&uag_cluster_policy[i]->frame_boost_ts,
+					     (s64)now);
+		}
+	} else if (cluster_id < UAG_MAX_CLUSTERS &&
+		   uag_cluster_policy[cluster_id]) {
+		atomic64_set(&uag_cluster_policy[cluster_id]->frame_boost_ts,
+			     (s64)now);
+	}
+}
+EXPORT_SYMBOL(uag_trigger_frame_boost);
+
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Module init / exit
@@ -1718,6 +1971,9 @@ static int __init uag_gov_module_init(void)
 		if (!proc_create("pd_capacity_tbl", 0444,
 				 uag_proc_root, &uag_pd_capacity_ops))
 			pr_warn("cpufreq_uag: pd_capacity_tbl create failed\n");
+		if (!proc_create("frame_boost", 0666,
+				 uag_proc_root, &uag_frame_boost_ops))
+			pr_warn("cpufreq_uag: frame_boost create failed\n");
 	}
 
 	ret = cpufreq_register_governor(&cpufreq_gov_uag);
