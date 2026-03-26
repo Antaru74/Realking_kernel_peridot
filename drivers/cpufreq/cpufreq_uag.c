@@ -26,7 +26,11 @@
 #include <linux/kthread.h>
 #include <linux/irq_work.h>
 #include <linux/sched/cpufreq.h>
-#include <linux/sched/walt.h>
+/*
+ * cpu_util_freq_walt() is declared in kernel/sched/walt/walt.h.
+ * Use a relative path since cpufreq_uag.c lives in drivers/cpufreq/.
+ */
+#include "../../kernel/sched/walt/walt.h"
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/cpumask.h>
@@ -43,13 +47,6 @@
 
 /* Forward declaration — used in uag_gov_init() before the full definition */
 static struct cpufreq_governor cpufreq_gov_uag;
-
-/*
- * cpu_util_cfs() is defined in kernel/sched/fair.c and used by schedutil,
- * so it is guaranteed to exist in vmlinux. It is not declared in any public
- * header, so we declare the prototype directly.
- */
-extern unsigned long cpu_util_cfs(int cpu);
 
 /*
  * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
@@ -381,7 +378,8 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	 */
 	sg_cpu->bw_dl = 0;
 
-	util = cpu_util_cfs(sg_cpu->cpu);
+	unsigned int reason = 0;
+	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
 
 	return util;
 }
