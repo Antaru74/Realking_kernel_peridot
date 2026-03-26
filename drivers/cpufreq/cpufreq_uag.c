@@ -26,11 +26,14 @@
 #include <linux/kthread.h>
 #include <linux/irq_work.h>
 #include <linux/sched/cpufreq.h>
+#include <linux/sched/walt.h>
 /*
- * cpu_util_freq_walt() is declared in kernel/sched/walt/walt.h.
- * Use a relative path since cpufreq_uag.c lives in drivers/cpufreq/.
+ * sched_cpu_util() is defined in kernel/sched/fair.c (built-in).
+ * Not declared in any public header, so we declare the prototype directly.
+ * This is the same util signal schedutil uses, and is always present in
+ * vmlinux regardless of CONFIG_SCHED_WALT.
  */
-#include "../../kernel/sched/walt/walt.h"
+extern unsigned long sched_cpu_util(int cpu);
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/cpumask.h>
@@ -378,15 +381,11 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	 */
 	sg_cpu->bw_dl = 0;
 
-#if IS_ENABLED(CONFIG_SCHED_WALT)
-	{
-		unsigned int reason = 0;
-		util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
-	}
-#else
-	/* Fallback when SCHED_WALT is not enabled */
+	/*
+	 * sched_cpu_util() is the same util source schedutil uses.
+	 * Available as a built-in symbol — no dependency on sched-walt.ko.
+	 */
 	util = sched_cpu_util(sg_cpu->cpu);
-#endif
 
 	return util;
 }
