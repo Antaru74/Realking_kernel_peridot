@@ -45,16 +45,20 @@
 static struct cpufreq_governor cpufreq_gov_uag;
 
 /*
- * cpu_util_freq_walt() is declared in kernel/sched/walt/walt.h which is
- * not a public header. The symbol IS present in vmlinux (used by
- * cpufreq_walt.c in the same tree), so we declare the prototype directly
- * to let the linker resolve it at module load time.
- * Signature taken from cpufreq_walt.c line 363 usage.
+ * cpu_util_freq_walt() and struct walt_cpu_load are declared in
+ * kernel/sched/walt/walt.h, which is not accessible from drivers/.
+ * Redeclare them here so the linker can resolve the symbol from vmlinux.
  */
-struct walt_cpu_load;
+struct walt_cpu_load {
+	unsigned long	nl;
+	unsigned long	pl;
+	bool		rtgb_active;
+	u64		ws;
+	bool		ed_active;
+};
 extern unsigned long cpu_util_freq_walt(int cpu,
 					struct walt_cpu_load *walt_load,
-					int *reasons);
+					unsigned int *reason);
 
 /*
  * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
@@ -387,12 +391,12 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	sg_cpu->bw_dl = 0;
 
 	/*
-	 * cpu_util_freq_walt() is resolved via extern prototype above.
-	 * Pass NULL for walt_load (not needed here) and a local reasons
-	 * variable as required by the function signature.
+	 * cpu_util_freq_walt() resolved via extern prototype above.
+	 * Pass NULL for walt_load (not needed here); reason is required
+	 * as unsigned int* per the actual signature.
 	 */
-	int reasons = 0;
-	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reasons);
+	unsigned int reason = 0;
+	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
 
 	return util;
 }
