@@ -45,6 +45,18 @@
 static struct cpufreq_governor cpufreq_gov_uag;
 
 /*
+ * cpu_util_freq_walt() is declared in kernel/sched/walt/walt.h which is
+ * not a public header. The symbol IS present in vmlinux (used by
+ * cpufreq_walt.c in the same tree), so we declare the prototype directly
+ * to let the linker resolve it at module load time.
+ * Signature taken from cpufreq_walt.c line 363 usage.
+ */
+struct walt_cpu_load;
+extern unsigned long cpu_util_freq_walt(int cpu,
+					struct walt_cpu_load *walt_load,
+					int *reasons);
+
+/*
  * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
  * Use policy->fast_switch_enabled as an equivalent check.
  */
@@ -375,12 +387,12 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	sg_cpu->bw_dl = 0;
 
 	/*
-	 * cpu_util_freq_walt() already applies uclamp and deadline
-	 * adjustments internally on Qualcomm GKI builds, so we do not
-	 * need the additional uclamp_rq_util_with() call that would
-	 * require the non-exported struct rq pointer.
+	 * cpu_util_freq_walt() is resolved via extern prototype above.
+	 * Pass NULL for walt_load (not needed here) and a local reasons
+	 * variable as required by the function signature.
 	 */
-	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, NULL);
+	int reasons = 0;
+	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reasons);
 
 	return util;
 }
