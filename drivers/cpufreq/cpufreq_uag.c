@@ -32,6 +32,7 @@
 #include <linux/kthread.h>
 #include <linux/irq_work.h>
 #include <linux/sched.h>
+#include <linux/sched/types.h>   /* full struct sched_attr definition */
 #include <linux/sched/cpufreq.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
