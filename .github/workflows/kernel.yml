@@ -179,6 +179,8 @@ jobs:
           cp ${OUT_DIR}/drivers/cpufreq/qcom-cpufreq-hw.ko artifacts/ || true
           cp ${OUT_DIR}/drivers/spmi/spmi-pmic-arb.ko artifacts/ || true
           cp ${OUT_DIR}/drivers/soc/qcom/dcvs/qcom-dcvs.ko artifacts/ || true
+          cp ${OUT_DIR}/drivers/cpufreq/cpufreq_uag.ko artifacts/ || true
+          cp ${OUT_DIR}/kernel/sched/walt/sched-walt.ko artifacts/ || true
         
 
 
