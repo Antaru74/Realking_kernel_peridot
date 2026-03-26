@@ -45,20 +45,10 @@
 static struct cpufreq_governor cpufreq_gov_uag;
 
 /*
- * cpu_util_freq_walt() and struct walt_cpu_load are declared in
- * kernel/sched/walt/walt.h, which is not accessible from drivers/.
- * Redeclare them here so the linker can resolve the symbol from vmlinux.
+ * cpu_util_freq_walt() is not present in this kernel's vmlinux.
+ * Use the GKI-standard cpu_util_cfs() from <linux/sched/cpufreq.h>
+ * which provides the same CFS utilisation signal used by schedutil.
  */
-struct walt_cpu_load {
-	unsigned long	nl;
-	unsigned long	pl;
-	bool		rtgb_active;
-	u64		ws;
-	bool		ed_active;
-};
-extern unsigned long cpu_util_freq_walt(int cpu,
-					struct walt_cpu_load *walt_load,
-					unsigned int *reason);
 
 /*
  * cpufreq_driver_is_hardlimited() is not exported in all GKI builds.
@@ -390,13 +380,7 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	 */
 	sg_cpu->bw_dl = 0;
 
-	/*
-	 * cpu_util_freq_walt() resolved via extern prototype above.
-	 * Pass NULL for walt_load (not needed here); reason is required
-	 * as unsigned int* per the actual signature.
-	 */
-	unsigned int reason = 0;
-	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
+	util = cpu_util_cfs(sg_cpu->cpu);
 
 	return util;
 }
