@@ -378,8 +378,15 @@ static unsigned long uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	 */
 	sg_cpu->bw_dl = 0;
 
-	unsigned int reason = 0;
-	util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
+#if IS_ENABLED(CONFIG_SCHED_WALT)
+	{
+		unsigned int reason = 0;
+		util = cpu_util_freq_walt(sg_cpu->cpu, NULL, &reason);
+	}
+#else
+	/* Fallback when SCHED_WALT is not enabled */
+	util = sched_cpu_util(sg_cpu->cpu);
+#endif
 
 	return util;
 }
