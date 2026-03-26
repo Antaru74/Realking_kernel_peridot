@@ -258,9 +258,28 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 	elapsed = now - uc->window_start;
 
 	if (elapsed >= UALT_WINDOW_NS) {
-		/* Commit current window to history */
+		/*
+		 * Fast-forward through missed windows.
+		 * When multiple windows have elapsed (e.g. after idle),
+		 * commit zero-util entries for the missed windows so that
+		 * demand decays properly instead of staying stuck at the
+		 * last active value.  Cap at HIST_SIZE to avoid spinning.
+		 */
+		int missed = (int)div64_u64(elapsed, UALT_WINDOW_NS);
+		int fill;
+
+		if (missed > UALT_HIST_SIZE)
+			missed = UALT_HIST_SIZE;
+
+		/* Commit the real window that just ended */
 		uc->hist[uc->hist_idx] = uc->curr_max;
 		uc->hist_idx = (uc->hist_idx + 1) % UALT_HIST_SIZE;
+
+		/* Fill remaining missed windows with zero */
+		for (fill = 1; fill < missed; fill++) {
+			uc->hist[uc->hist_idx] = 0;
+			uc->hist_idx = (uc->hist_idx + 1) % UALT_HIST_SIZE;
+		}
 
 		/* demand = max across history */
 		uc->demand = 0;
@@ -702,7 +721,38 @@ static bool uag_update_next_freq(struct uag_gov_policy *sg_policy,
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Main frequency calculation
+ *
+ * Base frequency uses schedutil's proven linear formula:
+ *   next_freq = C * max_freq * util / max,  where C = 1.25
+ *
+ * When target_loads has multiple entries (user-configured), the table-walk
+ * approach overrides the linear base — this is the "interactive governor"
+ * style that the original OnePlus UAG uses with device-tuned tables.
  * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * get_base_freq — schedutil's linear util→freq mapping.
+ * map_util_perf() and map_util_freq() are static inlines from
+ * <linux/sched/cpufreq.h>, always available.
+ */
+static unsigned int get_base_freq(struct uag_gov_policy *sg_policy,
+				   unsigned long util, unsigned long max)
+{
+	struct cpufreq_policy *policy = sg_policy->policy;
+	unsigned int freq;
+
+	freq = arch_scale_freq_invariant() ?
+		policy->cpuinfo.max_freq : policy->cur;
+
+	util = map_util_perf(util);        /* C = 1.25 headroom */
+	freq = map_util_freq(util, freq, max);
+
+	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
+		return sg_policy->next_freq;
+
+	sg_policy->cached_raw_freq = freq;
+	return cpufreq_driver_resolve_freq(policy, freq);
+}
 
 static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 					unsigned long util, unsigned long max)
@@ -716,7 +766,16 @@ static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 	if (tunables->util_scale_pct > 0 && tunables->util_scale_pct < 100)
 		scaled_util = util * tunables->util_scale_pct / 100;
 
-	freq = choose_freq_from_tl(sg_policy, scaled_util, max);
+	/*
+	 * Frequency selection strategy:
+	 *   ntarget_loads > 1 → user has configured a multi-entry table,
+	 *                       use interactive-governor style table walk.
+	 *   ntarget_loads <= 1 → default, use schedutil linear mapping.
+	 */
+	if (tunables->ntarget_loads > 1)
+		freq = choose_freq_from_tl(sg_policy, scaled_util, max);
+	else
+		freq = get_base_freq(sg_policy, scaled_util, max);
 
 	/* hispeed boost */
 	if (tunables->hispeed_freq) {
