@@ -134,6 +134,12 @@ struct uag_gov_tunables {
 	/* util_scale_pct: UV/power reduction feature */
 	unsigned int util_scale_pct;    /* 1-100, default 100 */
 
+	/* ── UALT (WALT-equivalent estimator) ──
+	 * Default OFF — raw PELT passthrough (schedutil-identical).
+	 * When ON, applies windowed demand tracking + NL/PL/ED.
+	 */
+	bool ualt_enable;
+
 	/* ── SchedTune-equivalent boost ──
 	 * Applies: util += (max - util) * stune_boost_pct / 100
 	 * At 0: no effect.  At 10: adds 10% of remaining headroom.
@@ -244,9 +250,7 @@ struct ualt_cpu {
 	unsigned long curr_max;
 	unsigned long prev_util;
 
-	unsigned long hist[UALT_HIST_SIZE];
-	int           hist_idx;
-	unsigned long demand;
+	unsigned long demand;        /* EWMA of window peaks */
 
 	u32           buckets[UALT_NUM_BUCKETS];
 	unsigned long pl;
@@ -288,10 +292,7 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 	if (elapsed >= UALT_WINDOW_NS) {
 		/*
 		 * Fast-forward through missed windows.
-		 * When multiple windows have elapsed (e.g. after idle),
-		 * commit zero-util entries for the missed windows so that
-		 * demand decays properly instead of staying stuck at the
-		 * last active value.  Cap at HIST_SIZE to avoid spinning.
+		 * For each missed window, decay demand by 3/4 with zero input.
 		 */
 		int missed = (int)div64_u64(elapsed, UALT_WINDOW_NS);
 		int fill;
@@ -299,21 +300,19 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 		if (missed > UALT_HIST_SIZE)
 			missed = UALT_HIST_SIZE;
 
-		/* Commit the real window that just ended */
-		uc->hist[uc->hist_idx] = uc->curr_max;
-		uc->hist_idx = (uc->hist_idx + 1) % UALT_HIST_SIZE;
+		/*
+		 * Demand: EWMA instead of max-of-history.
+		 * demand = demand * 3/4 + curr_max * 1/4
+		 *
+		 * The old max-of-5-windows approach meant one spike held
+		 * demand at peak for 40ms.  EWMA decays geometrically:
+		 * after 4 idle windows demand drops to ~32% of original.
+		 */
+		uc->demand = (uc->demand * 3 + uc->curr_max) / 4;
 
-		/* Fill remaining missed windows with zero */
-		for (fill = 1; fill < missed; fill++) {
-			uc->hist[uc->hist_idx] = 0;
-			uc->hist_idx = (uc->hist_idx + 1) % UALT_HIST_SIZE;
-		}
-
-		/* demand = max across history */
-		uc->demand = 0;
-		for (i = 0; i < UALT_HIST_SIZE; i++)
-			if (uc->hist[i] > uc->demand)
-				uc->demand = uc->hist[i];
+		/* Decay demand for missed (idle) windows */
+		for (fill = 1; fill < missed; fill++)
+			uc->demand = uc->demand * 3 / 4;
 
 		/* Predicted load bucket update */
 		bucket = (int)((raw * UALT_NUM_BUCKETS) / (cap + 1));
@@ -377,16 +376,45 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 
 	uc->prev_sample = raw;
 
-	/* Compose final util */
-	out = max(uc->prev_util, uc->demand);
-	out = max(out, uc->pl);
-	out = max(out, raw);
+	/* ──────────────────────────────────────────────────────
+	 * Compose final util — proportional, not all-max.
+	 *
+	 * Base is always the current raw PELT value.
+	 * UALT signals pull util up *proportionally*:
+	 *
+	 *   demand → if higher than raw, blend in at 50%:
+	 *            out = raw + (demand - raw) / 2
+	 *   pl     → predicted load acts as a gentle floor
+	 *   nl     → new-load burst (additive, capped)
+	 *   ed     → early-detection override (keeps as-is)
+	 *
+	 * The old approach of max(prev_util, demand, pl, raw)
+	 * could only push freq UP, never DOWN — one spike
+	 * locked freq at max for 40ms+.
+	 * ────────────────────────────────────────────────────── */
+	out = raw;
 
-	if (uc->nl)
-		out = min(out + uc->nl, cap);
+	/* Demand pull-up: blend toward demand if it's higher */
+	if (uc->demand > out)
+		out = out + (uc->demand - out) / 2;
 
-	if (uc->ed_active)
-		out = max(out, uc->ed_util);
+	/* Predicted load floor (at 75% weight) */
+	{
+		unsigned long pl_adj = uc->pl * 3 / 4;
+		if (pl_adj > out)
+			out = pl_adj;
+	}
+
+	/* New-load burst (additive, capped at 25% of capacity) */
+	if (uc->nl) {
+		unsigned long nl_cap = cap / 4;
+		unsigned long nl_add = min(uc->nl, nl_cap);
+		out = min(out + nl_add, cap);
+	}
+
+	/* Early-detection override (genuine sustained high load) */
+	if (uc->ed_active && uc->ed_util > out)
+		out = uc->ed_util;
 
 	raw_spin_unlock_irqrestore(&uc->lock, flags);
 
@@ -640,8 +668,19 @@ static void uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	/* Raw PELT util — base signal */
 	raw  = sched_cpu_util(sg_cpu->cpu);
 
-	/* UALT enhancement */
-	util = ualt_update(sg_cpu->cpu, raw, sg_cpu->max, now);
+	/*
+	 * UALT: optional WALT-equivalent enhancement.
+	 * Default OFF — raw PELT passthrough (identical to schedutil).
+	 * When ON, applies windowed demand tracking + NL/PL/ED with
+	 * proportional blending (not aggressive all-max).
+	 */
+	{
+		struct uag_gov_tunables *t = sg_cpu->sg_policy->tunables;
+		if (t && t->ualt_enable)
+			util = ualt_update(sg_cpu->cpu, raw, sg_cpu->max, now);
+		else
+			util = raw;
+	}
 
 	/*
 	 * SchedTune-equivalent boost.
@@ -1314,6 +1353,23 @@ static ssize_t cobuck_enable_store(struct gov_attr_set *s,
 }
 static struct governor_attr cobuck_enable_attr = __ATTR_RW(cobuck_enable);
 
+/* ── ualt_enable ── */
+static ssize_t ualt_enable_show(struct gov_attr_set *s, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			 to_uag_tunables(s)->ualt_enable);
+}
+static ssize_t ualt_enable_store(struct gov_attr_set *s,
+				  const char *buf, size_t count)
+{
+	unsigned int val;
+	if (kstrtouint(buf, 10, &val))
+		return -EINVAL;
+	to_uag_tunables(s)->ualt_enable = !!val;
+	return count;
+}
+static struct governor_attr ualt_enable_attr = __ATTR_RW(ualt_enable);
+
 /* ── util_scale_pct ── */
 static ssize_t util_scale_pct_show(struct gov_attr_set *s, char *buf)
 {
@@ -1398,6 +1454,7 @@ static struct attribute *uag_gov_attrs[] = {
 	&report_policy_attr.attr,
 	&multi_tl_enable_attr.attr,
 	&cobuck_enable_attr.attr,
+	&ualt_enable_attr.attr,
 	&util_scale_pct_attr.attr,
 	&stune_boost_pct_attr.attr,
 	&frame_boost_freq_attr.attr,
@@ -1543,6 +1600,7 @@ static struct uag_gov_tunables *uag_tunables_alloc(struct uag_gov_policy *sg_pol
 	tunables->report_policy      = REPORT_NONE;
 	tunables->multi_tl_enable    = false;
 	tunables->cobuck_enable      = false;
+	tunables->ualt_enable        = false;  /* raw PELT by default */
 	tunables->util_scale_pct     = 100;
 	tunables->stune_boost_pct    = 0;
 	tunables->frame_boost_freq   = 0;    /* disabled by default */
