@@ -350,7 +350,8 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 			unsigned long jump = raw - uc->prev_sample;
 			if (jump > cap * UALT_NL_JUMP_PCT / 100)
 				uc->nl = jump;
-			else if (uc->nl && raw <= uc->prev_sample)
+			else if (uc->nl)
+				/* jump too small to sustain NL — clear it */
 				uc->nl = 0;
 		} else {
 			uc->nl = 0;
@@ -714,7 +715,7 @@ static void uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 	 */
 	{
 		struct uag_gov_tunables *t = sg_cpu->sg_policy->tunables;
-		if (t && t->stune_boost_pct > 0) {
+		if (t && t->stune_boost_pct > 0 && util < sg_cpu->max) {
 			unsigned long headroom = sg_cpu->max - util;
 			util += headroom * t->stune_boost_pct / 100;
 		}
@@ -1902,8 +1903,7 @@ void set_soft_limit_freq(int cpu, unsigned int freq)
 	struct uag_gov_cpu *sg_cpu = &per_cpu(uag_gov_cpu, cpu);
 	struct uag_gov_policy *sg_policy;
 
-	if (!sg_cpu)
-		return;
+	/* &per_cpu() never returns NULL — check sg_policy instead */
 	sg_policy = sg_cpu->sg_policy;
 	if (!sg_policy || !sg_policy->tunables)
 		return;
@@ -1920,8 +1920,7 @@ void set_sugov_tl_uag(int cpu, unsigned int tl)
 	struct uag_gov_tunables *t;
 	unsigned long flags;
 
-	if (!sg_cpu)
-		return;
+	/* &per_cpu() never returns NULL — check sg_policy instead */
 	sg_policy = sg_cpu->sg_policy;
 	if (!sg_policy)
 		return;
