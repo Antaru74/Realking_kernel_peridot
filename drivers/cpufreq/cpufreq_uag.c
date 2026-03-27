@@ -825,19 +825,56 @@ static bool uag_update_next_freq(struct uag_gov_policy *sg_policy,
 /* ═══════════════════════════════════════════════════════════════════════
  * Main frequency calculation
  *
- * Frequency is always selected via choose_freq_from_tl(), which walks
- * the OPP table comparing util against per-OPP capacity scaled by
- * target_load.  This matches the original UAG's nlopp + update_util_tl
- * pipeline.
+ * DEFAULT PATH (ntarget_loads <= 1):
+ *   Bit-for-bit identical to schedutil's get_next_freq(), including the
+ *   trace_android_vh_map_util_freq() vendor hook.  Qualcomm / OPLUS
+ *   hook into this tracepoint to customize the util→freq mapping.
+ *   NOT calling this hook was the cause of max-freq pinning — the
+ *   platform's hook may apply corrections (energy model, cluster
+ *   coupling, etc.) that are essential for correct operation.
  *
- * With the default single-entry target_loads={80}, the mapping is
- * equivalent to schedutil's C=1.25 headroom: each OPP is selected
- * when util reaches 80% of its capacity (1/0.8 = 1.25x headroom).
+ * TARGET_LOADS PATH (ntarget_loads > 1):
+ *   Interactive-governor style table walk using per-OPP capacity.
+ *   Used only when the user writes a multi-entry target_loads table.
  *
- * With user-configured multi-entry target_loads, the curve can be
- * shaped per frequency range — this is the "interactive governor"
- * style tuning that OnePlus uses with vendor-specific tables.
+ * After the base frequency is determined, UAG overlays are applied:
+ *   hispeed_freq, soft_limit, frame_boost.
  * ═══════════════════════════════════════════════════════════════════════ */
+
+/*
+ * get_base_freq_schedutil — schedutil's get_next_freq(), verbatim.
+ * This is the proven, production-tested util→freq mapping.
+ */
+static unsigned int get_base_freq_schedutil(struct uag_gov_policy *sg_policy,
+					     unsigned long util,
+					     unsigned long max)
+{
+	struct cpufreq_policy *policy = sg_policy->policy;
+	unsigned int freq = arch_scale_freq_invariant() ?
+				policy->cpuinfo.max_freq : policy->cur;
+	unsigned long next_freq = 0;
+
+	util = map_util_perf(util);
+
+	/*
+	 * Vendor hook: Qualcomm and OPLUS register callbacks here to
+	 * override the linear util→freq mapping with energy-model-aware
+	 * or cluster-coupling-aware frequency selection.
+	 * Schedutil calls this — we must too, or we get different freqs.
+	 */
+	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
+				       &sg_policy->need_freq_update);
+	if (next_freq)
+		freq = next_freq;
+	else
+		freq = map_util_freq(util, freq, max);
+
+	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
+		return sg_policy->next_freq;
+
+	sg_policy->cached_raw_freq = freq;
+	return cpufreq_driver_resolve_freq(policy, freq);
+}
 
 static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 					unsigned long util, unsigned long max)
@@ -851,7 +888,15 @@ static unsigned int uag_get_final_freq(struct uag_gov_policy *sg_policy,
 	if (tunables->util_scale_pct > 0 && tunables->util_scale_pct < 100)
 		scaled_util = util * tunables->util_scale_pct / 100;
 
-	freq = choose_freq_from_tl(sg_policy, scaled_util, max);
+	/*
+	 * Frequency selection:
+	 *   Default: schedutil-identical (linear + vendor hook)
+	 *   Override: target_loads table walk (when user has configured one)
+	 */
+	if (tunables->ntarget_loads > 1)
+		freq = choose_freq_from_tl(sg_policy, scaled_util, max);
+	else
+		freq = get_base_freq_schedutil(sg_policy, scaled_util, max);
 
 	/* hispeed boost */
 	if (tunables->hispeed_freq) {
@@ -2013,6 +2058,45 @@ void uag_trigger_frame_boost(int cluster_id)
 }
 EXPORT_SYMBOL(uag_trigger_frame_boost);
 
+/*
+ * /proc/uag/debug — diagnostic dump of per-cpu util, freq, tunables.
+ * Read this to diagnose frequency selection issues.
+ */
+static int uag_debug_show(struct seq_file *m, void *v)
+{
+	int cpu;
+	for_each_online_cpu(cpu) {
+		struct uag_gov_cpu *sg_cpu = &per_cpu(uag_gov_cpu, cpu);
+		struct uag_gov_policy *sgp = sg_cpu->sg_policy;
+		unsigned long raw_util = sched_cpu_util(cpu);
+		unsigned long cap = arch_scale_cpu_capacity(cpu);
+
+		seq_printf(m, "cpu%d: raw_pelt=%lu cap=%lu stored_util=%lu max=%lu",
+			   cpu, raw_util, cap, sg_cpu->util, sg_cpu->max);
+		if (sgp) {
+			struct uag_gov_tunables *t = sgp->tunables;
+			seq_printf(m, " next_freq=%u", sgp->next_freq);
+			if (t)
+				seq_printf(m, " tl[0]=%u ntl=%d scale=%u ualt=%d stune=%u",
+					   t->target_loads[0], t->ntarget_loads,
+					   t->util_scale_pct, t->ualt_enable,
+					   t->stune_boost_pct);
+		}
+		seq_puts(m, "\n");
+	}
+	return 0;
+}
+static int uag_debug_open(struct inode *i, struct file *f)
+{
+	return single_open(f, uag_debug_show, NULL);
+}
+static const struct proc_ops uag_debug_ops = {
+	.proc_open    = uag_debug_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Module init / exit
@@ -2032,6 +2116,9 @@ static int __init uag_gov_module_init(void)
 		if (!proc_create("frame_boost", 0666,
 				 uag_proc_root, &uag_frame_boost_ops))
 			pr_warn("cpufreq_uag: frame_boost create failed\n");
+		if (!proc_create("debug", 0444,
+				 uag_proc_root, &uag_debug_ops))
+			pr_warn("cpufreq_uag: debug create failed\n");
 	}
 
 	ret = cpufreq_register_governor(&cpufreq_gov_uag);
