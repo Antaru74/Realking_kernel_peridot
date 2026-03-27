@@ -60,7 +60,7 @@ static struct cpufreq_governor cpufreq_gov_uag;
 /* ── Constants ─────────────────────────────────────────── */
 #define DEFAULT_TARGET_LOAD      80
 #define DEFAULT_HISPEED_LOAD     90
-#define DEFAULT_UP_RATE_LIMIT    500    /* µs */
+#define DEFAULT_UP_RATE_LIMIT    1000   /* µs — 1ms: reduces idle freq jitter */
 #define DEFAULT_DOWN_RATE_LIMIT  2000   /* µs */
 #define DEFAULT_BREAK_FREQ_MARGIN 5     /* % */
 #define MAX_TARGET_LOADS         16
@@ -135,8 +135,9 @@ struct uag_gov_tunables {
 	unsigned int util_scale_pct;    /* 1-100, default 100 */
 
 	/* ── UALT (WALT-equivalent estimator) ──
-	 * Default OFF — raw PELT passthrough (schedutil-identical).
-	 * When ON, applies windowed demand tracking + NL/PL/ED.
+	 * Default ON — applies windowed demand tracking + NL/PL/ED with
+	 * idle suppression (demand/pl pull-up scales to zero at idle).
+	 * When OFF, raw PELT passthrough (schedutil-identical).
 	 */
 	bool ualt_enable;
 
@@ -244,6 +245,7 @@ static unsigned int default_target_loads_sys[] = { DEFAULT_TARGET_LOAD };
 #define UALT_ED_SUSTAIN_NS     1000000ULL  /* ED: must hold 1 ms         */
 #define UALT_NL_JUMP_PCT       15          /* NL: jump% that means wakeup*/
 #define UALT_PRED_DECAY_SH     3           /* bucket decay: *7/8 per win */
+#define UALT_IDLE_THRESH_PCT   20          /* below this %, scale back demand/pl pull-up */
 
 struct ualt_cpu {
 	u64           window_start;
@@ -394,15 +396,36 @@ static unsigned long ualt_update(int cpu, unsigned long raw,
 	 * ────────────────────────────────────────────────────── */
 	out = raw;
 
-	/* Demand pull-up: blend toward demand if it's higher */
-	if (uc->demand > out)
-		out = out + (uc->demand - out) / 2;
-
-	/* Predicted load floor (at 75% weight) */
+	/*
+	 * Idle suppression: when raw util is below UALT_IDLE_THRESH_PCT of
+	 * capacity, scale back history-based pull-ups (demand, pl) linearly
+	 * toward zero.  This prevents stale demand history from keeping the
+	 * frequency elevated during genuine idle.
+	 *
+	 *   blend = raw / idle_thresh   (0..256 fixed-point)
+	 *
+	 * NL and ED are NOT suppressed — they respond to real load events
+	 * (task wakeup, sustained high util), not stale history.
+	 */
 	{
-		unsigned long pl_adj = uc->pl * 3 / 4;
-		if (pl_adj > out)
-			out = pl_adj;
+		unsigned long idle_thresh = cap * UALT_IDLE_THRESH_PCT / 100;
+		unsigned long blend = (raw < idle_thresh && idle_thresh > 0)
+				      ? (raw * 256) / idle_thresh
+				      : 256;
+
+		/* Demand pull-up: blend toward demand if it's higher */
+		if (uc->demand > out) {
+			unsigned long pull = (uc->demand - out) / 2;
+			pull = (pull * blend) >> 8;  /* scale by idle suppression */
+			out += pull;
+		}
+
+		/* Predicted load floor (at 75% weight, idle-suppressed) */
+		{
+			unsigned long pl_adj = (uc->pl * 3 / 4 * blend) >> 8;
+			if (pl_adj > out)
+				out = pl_adj;
+		}
 	}
 
 	/* New-load burst (additive, capped at 25% of capacity) */
@@ -670,9 +693,9 @@ static void uag_gov_get_util(struct uag_gov_cpu *sg_cpu)
 
 	/*
 	 * UALT: optional WALT-equivalent enhancement.
-	 * Default OFF — raw PELT passthrough (identical to schedutil).
-	 * When ON, applies windowed demand tracking + NL/PL/ED with
-	 * proportional blending (not aggressive all-max).
+	 * Default ON — applies windowed demand tracking + NL/PL/ED with
+	 * idle suppression (proportional blend, not aggressive all-max).
+	 * When OFF, raw PELT passthrough (identical to schedutil).
 	 */
 	{
 		struct uag_gov_tunables *t = sg_cpu->sg_policy->tunables;
@@ -1645,7 +1668,7 @@ static struct uag_gov_tunables *uag_tunables_alloc(struct uag_gov_policy *sg_pol
 	tunables->report_policy      = REPORT_NONE;
 	tunables->multi_tl_enable    = false;
 	tunables->cobuck_enable      = false;
-	tunables->ualt_enable        = false;  /* raw PELT by default */
+	tunables->ualt_enable        = true;   /* UALT on by default */
 	tunables->util_scale_pct     = 100;
 	tunables->stune_boost_pct    = 0;
 	tunables->frame_boost_freq   = 0;    /* disabled by default */
